@@ -1,0 +1,38 @@
+# Python: байткод, кеши тестов/линтера
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# Главное окружение проекта (жёсткие пины torch/transformers)
+.venv/
+
+# Сгенерированные записи: FLAC/MP3/ABC/меты + производные
+# (превью, DSP-варианты, овердабы, латенты, кеш метрик — outputs/<stem>.d/)
+outputs/
+
+# Локальные кеши (HF remote-code и пр.)
+.cache/
+
+# Венвы сторонних инструментов (basic-pitch сейчас, metrics позже)
+third_party/*/venv/
+
+# node-зависимости завендоренного midi2abc (код cli.mjs/src — в репозитории)
+third_party/midi2abc/node_modules/
+
+# Снапшот модели SheetSage2 (веса) — ставится отдельно, не версионируется
+third_party/sheetsage2/SheetSage2/
+
+# Тяжёлые архивы/бэкапы (напр. уюе2.zip)
+*.zip
+*.tar.gz
+
+# Системный мусор
+.DS_Store
+Thumbs.db
+
+# Логи
+*.log
+
+# Примечание: yue2_infer-*.whl (66 КБ) сознательно версионируется —
+# это vendored-зависимость для воспроизводимости окружения.
