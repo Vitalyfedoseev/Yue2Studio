@@ -25,6 +25,69 @@ YUE2_VAE=m-a-p/YuE2-Vae-legacy ./run.sh  # VAE для бенчмарков (по
 `yue2_infer`, ставить только так: `PIP_CONFIG_FILE=/dev/null .venv/bin/python /tmp/pip4.py install ...`,
 см. памятку — системный pip.conf с NGC-индексом и IPv6-only DNS ломают установку).
 
+## Развёртывание с нуля
+
+### Требования
+
+- Linux x86_64 (эталон — Ubuntu 24.04, Python 3.12), NVIDIA GPU от 16 ГБ VRAM
+  (пик генерации 8–14 ГБ) с рабочим драйвером (`nvidia-smi` без ошибок);
+- **node** ≥ 20 (конвертер MIDI→ABC; ищется в PATH, затем в nvm —
+  `~/.nvm/versions/node/v*/bin/node`), **ffmpeg** в PATH;
+- диск: ~10 ГБ venv + ~13 ГБ моделей в HF-кеше (YuE2-3B ≈ 8 ГБ, SheetSage2 + MERT ≈ 5 ГБ)
+  + место под `outputs/` (≈12 МБ на минуту готовой музыки с латентами);
+- вход в HuggingFace с доступом к **m-a-p** (YuE2-3B, YuE2-Vae, SheetSage2, MERT-v2-FullSong):
+  `huggingface-cli login` от того же пользователя, что запускает сервис.
+
+### Окружение `.venv/`
+
+Жёсткие пины wheel'а `yue2_infer` (torch 2.10.0+cu128, transformers 4.57.6) — ставить только
+с отключённым системным pip.conf (NGC-индекс и IPv6-only DNS ломают установку, см. памятку):
+
+```bash
+python3.12 -m venv .venv
+
+PIP_CONFIG_FILE=/dev/null .venv/bin/pip install \
+  torch==2.10.0+cu128 torchaudio==2.10.0+cu128 \
+  --index-url https://download.pytorch.org/whl/cu128
+
+PIP_CONFIG_FILE=/dev/null .venv/bin/pip install \
+  transformers==4.57.6 scipy soundfile numpy fastapi "uvicorn[standard]"
+
+# то, что wheel тянет криво — без зависимостей:
+PIP_CONFIG_FILE=/dev/null .venv/bin/pip install --no-deps \
+  pretty_midi mido mir_eval six importlib_resources decorator
+
+PIP_CONFIG_FILE=/dev/null .venv/bin/pip install ./yue2_infer-0.1.5-py3-none-any.whl
+
+# метрики и тесты (резолвер не трогает пины, проверено dry-run'ом):
+.venv/bin/pip install librosa pytest httpx
+```
+
+Эталон версий — рабочая машина; при расхождении сверить `.venv/bin/pip list` с ней.
+
+### Сторонние инструменты (`third_party/`)
+
+| Каталог | Что это | Подготовка |
+|---|---|---|
+| `midi2abc/` | конвертер MIDI→ABC (Node, MIT) + `node_modules` | уже завендорен; при чистой копии — `npm install` внутри |
+| `sheetsage2/` | основной движок аудио→ABC (m-a-p) | снапшот весов `SheetSage2/` положить руками (не версионируется); работает из основного `.venv`, при первом прогоне докачает MERT-v2-FullSong (~3 мин) |
+| `audio2midi/` | фолбэк basic-pitch (отдельный venv) | рецепт установки — `third_party/audio2midi/README.md` (`--no-deps`, `numpy==1.26.4`, `setuptools<82`); без него аудио-фолбэк недоступен, SheetSage2 остаётся основным |
+
+### Запуск и проверка
+
+```bash
+./run.sh                                   # 8220; модель качается при первом старте (~8 ГБ, единожды)
+curl -s localhost:8220/api/health          # ждём ready:true (1–2 мин загрузки в VRAM)
+.venv/bin/python -m pytest tests/ -q       # 24 теста без GPU
+```
+
+Переменные окружения: `YUE2_HOST` (по умолч. 0.0.0.0 — домашняя сеть),
+`YUE2_PORT` (8220), `YUE2_MODEL`/`YUE2_VAE` (m-a-p/YuE2-3B и YuE2-Vae),
+`YUE2_MAX_TOKENS` (22000 — бюджет на песню, ≈10–14 мин),
+`YUE2_NO_MODEL=1` (тестовый режим без GPU). Обновления кода — перезапуск
+(`pkill -f 'uvicorn [s]erver:app'` — со скобкой, иначе pkill убьёт собственный shell);
+правки `static/` подхватываются по F5 без перезапуска.
+
 ## Инструкция по эксплуатации
 
 ### Подъём и остановка
@@ -80,17 +143,6 @@ pkill -f 'uvicorn [s]erver:app'                    # остановить (бе�
   метку. «Удалить запись» стирает всё, включая латенты и производные.
 - История: поиск по названию/тексту/стилю, ★-лайки с фильтром, клик = играть;
   плеер ходит ‹ › по списку и сам переходит к следующему треку.
-
-### Типовые проблемы
-
-| Симптом | Причина и лечение |
-|---|---|
-| `ready:false`, «модель ещё грузится» | Подождать 1–2 мин после старта |
-| 503 «модель не загрузилась: …Error 804 / driver mismatch» | Драйвер NVIDIA обновился без перезагрузки (`nvidia-smi` покажет version mismatch) — перезагрузить машину и поднять сервис заново |
-| 409 «GPU занят генерацией» | План/превью делят одну GPU с генерацией — повторить после освобождения очереди |
-| 404 на секции/превью/овердаб | Запись сделана до появления артефактов (нет `score.abc`/`latent.npy`) — только новые генерации |
-| CUDA out of memory | Укоротить лирику или снизить `YUE2_MAX_TOKENS`; черновик вместо полного рендера |
-| «динь» не звучит | Браузер блокирует звук до первого клика (политика автоплея) — клик по «Сгенерировать» разблокирует |
 
 ### Обслуживание
 
