@@ -84,6 +84,18 @@
   }
   .btn:disabled { opacity: .45; cursor: default; }
   .btn.stop { background: linear-gradient(135deg, #b33951, #ff6b7a); margin-top: 8px; display: none; }
+  .btnrow { display: flex; gap: 8px; margin-top: 16px; flex-wrap: wrap; }
+  .btnrow .btn { margin-top: 0; }
+  .btnrow .btn:first-child { flex: 1 1 170px; }   /* главная кнопка тянется, остальное переносится */
+  .btn.ghost { background: var(--panel2); border: 1px solid var(--border); color: var(--text); }
+  .btn.ghost:hover { border-color: var(--accent); }
+  .btn.fan { display: flex; align-items: center; gap: 5px; flex: none; padding: 12px 10px; }
+  .btn.fan select { width: auto; padding: 2px 4px; background: transparent; border: none;
+    color: inherit; font: inherit; }
+  .btn.fan select option { color: var(--text); background: var(--panel2); }
+  /* ряд режимов (план/guidance/seed/драматургия): 2×2 на узкой колонке */
+  .row4 { display: flex; gap: 10px; flex-wrap: wrap; }
+  .row4 > div { flex: 1 1 46%; min-width: 130px; }
 
   #status { margin-top: 14px; font-size: 13px; }
   .bar { height: 7px; background: var(--panel2); border-radius: 99px; overflow: hidden; margin-top: 7px; }
@@ -142,6 +154,46 @@
 
   a.dl { color: var(--accent2); font-size: 13px; text-decoration: none; }
   a.dl:hover { text-decoration: underline; }
+
+  /* модалка (редактор плана ABC) */
+  .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.6);
+    display: none; z-index: 100; align-items: flex-start; justify-content: center;
+    padding: 40px 16px; }
+  .modal-overlay.open { display: flex; }
+  .modal { background: var(--panel); border: 1px solid var(--border); border-radius: 14px;
+    width: min(880px, 100%); max-height: calc(100vh - 80px); overflow-y: auto; padding: 18px; }
+  .modal h3 { margin: 0 0 8px; font-size: 16px; }
+  .modal .btn { margin-top: 12px; }
+
+  /* лента секций трека */
+  .secstrip { display: flex; flex-wrap: wrap; gap: 6px; }
+  .secchip { font-size: 11px; padding: 3px 8px; border-radius: 6px; cursor: pointer;
+    background: var(--panel2); border: 1px solid var(--border); color: var(--muted); }
+  .secchip:hover { color: var(--text); border-color: var(--accent); }
+  .secchip b { color: var(--text); font-weight: 600; }
+  .secchip.off { opacity: .55; }
+
+  /* пары ключ-значение (метрики) и дельты */
+  .kv { display: grid; grid-template-columns: 1fr 1fr; gap: 3px 16px; font-size: 12px; }
+  .kv > div { display: flex; justify-content: space-between; gap: 8px;
+    border-bottom: 1px dashed color-mix(in srgb, var(--border) 55%, transparent); padding: 2px 0; }
+  .d-up { color: var(--ok); } .d-down { color: var(--err); } .d-zero { color: var(--muted); }
+
+  /* крутилки параметров DSP */
+  .param { margin: 7px 0; max-width: 100%; }
+  .param label { margin: 0 0 2px; display: flex; justify-content: space-between; min-width: 0; }
+  .param input[type=range] { display: block; width: 100%; max-width: 100%;
+    padding: 0; accent-color: var(--accent); }
+
+  .iconbtn { flex: none; cursor: pointer; color: var(--muted); padding: 5px 10px;
+    border-radius: 8px; border: 1px solid var(--border); background: var(--panel2);
+    font-size: 13px; user-select: none; }
+  .iconbtn:hover { color: var(--text); border-color: var(--accent); }
+
+  /* светлую тему держим на CSS-переменных тёмной по умолчанию */
+  html[data-theme="light"] { --bg: #eef0f5; --panel: #ffffff; --panel2: #e7e9f2;
+    --border: #c7ccdd; --text: #1c2030; --muted: #5a6180; }
+  html[data-theme="light"] header { background: rgba(238,240,245,.92); }
 </style>
 </head>
 <body>
@@ -152,6 +204,7 @@
   <span class="chip" id="chipQueue">очередь: —</span>
   <div class="spacer"></div>
   <span class="chip">стиль + лирика → песня с вокалом · 48 кГц · длина следует за лирикой</span>
+  <span class="iconbtn" id="themeToggle" title="Светлая/тёмная тема">◐</span>
 </header>
 
 <main>
@@ -161,7 +214,12 @@
       <div class="st-line" id="stLine">Сервер поднимается…</div>
       <div class="st-line" id="queueLine" hidden></div>
     </div>
-    <button class="btn" id="go">Сгенерировать песню</button>
+    <div class="btnrow">
+      <button class="btn" id="go">Сгенерировать песню</button>
+      <button class="btn ghost" id="goDraft" title="Короткий рендер ~15–20 с на прикидку стиля/лирики">Черновик</button>
+      <button class="btn ghost fan" id="goFan" title="Несколько вариантов подряд: сиды base+0..N-1">×<select id="fanN"><option>2</option><option selected>5</option><option>8</option></select></button>
+      <button class="btn ghost" id="goPlan" title="Построить ABC-план без рендера: посмотреть, поправить, отрендерить по нему">План ABC</button>
+    </div>
     <button class="btn stop" id="stop">Остановить генерацию</button>
 
     <label>Название песни — уйдёт в имя файла при скачивании</label>
@@ -170,6 +228,14 @@
     <label>Стиль (genre, темп, настроение, аранжировка)</label>
     <textarea id="style" rows="4" placeholder="Жанр, BPM, настроение, инструменты…"></textarea>
     <div class="tags" id="stylePresets"></div>
+    <div class="hint" id="styleWarn" hidden style="color:var(--warn)"></div>
+    <details style="margin-top:6px">
+      <summary class="hint" style="cursor:pointer">Библиотека стилей — 27 групп · калиброванные пресеты с сидами ⚡</summary>
+      <select id="libGroup" style="margin-top:6px"></select>
+      <div id="libItems" class="tags" style="margin-top:6px"></div>
+      <div class="hint">Клик — применить строкой 1:1; пресет ⚡ подставляет и свой seed. Русские слова в стиле переводятся словарём при отправке.</div>
+      <span class="iconbtn" id="libSave" style="margin-top:6px">＋ сохранить текущий стиль в «Мои»</span>
+    </details>
 
     <label>Голос — отдельно (склеивается со стилем при отправке)</label>
     <div class="vtabs" id="voiceTabs"></div>
@@ -180,6 +246,17 @@
     <label>Лирика</label>
     <textarea id="lyrics" rows="9" spellcheck="false"></textarea>
     <div class="tags" id="secTags"></div>
+    <div style="display:flex; gap:8px; align-items:center; margin-top:6px">
+      <label class="tag" style="display:flex; gap:6px; align-items:center; cursor:pointer; margin:0">
+        <input type="checkbox" id="noVocals" style="width:auto"> без слов (инструментал)
+      </label>
+      <select id="instLen" style="width:auto; flex:none">
+        <option value="1" selected>короткий (~1 секция)</option>
+        <option value="3">~1,5 мин</option>
+        <option value="8">~3–4 мин</option>
+        <option value="16">~6–8 мин</option>
+      </select>
+    </div>
     <div class="hint warn" style="color:var(--warn)">Тег секции — на отдельной строке. Длина песни следует за объёмом лирики (поднятый лимит ≈ 10–14 мин при пике VRAM ~14 ГБ).</div>
 
     <label>Кавер по MIDI или аудио — готовая мелодия вместо авторского плана</label>
@@ -190,13 +267,13 @@
       <div class="hint"><span id="abcStat"></span> · <span class="tag" id="midiClear" style="display:inline-block;margin:0;padding:2px 9px">убрать</span><a id="midiDl" class="dl" hidden style="margin-left:10px" download>скачать .mid</a></div>
     </div>
 
-    <div class="row">
+    <div class="row4">
       <div>
         <label>Режим планирования</label>
-        <select id="cot">
-          <option value="full" selected>full — мелодия + гармония (рекоменд.)</option>
-          <option value="melody">melody — только мелодия (для каверов)</option>
-          <option value="off">off — без нотного плана</option>
+        <select id="cot" title="full — модель сама пишет нотный план; melody — только мелодия (для каверов); off — без плана">
+          <option value="full" selected>full — план (рекоменд.)</option>
+          <option value="melody">melody — только мелодия</option>
+          <option value="off">off — без плана</option>
         </select>
       </div>
       <div>
@@ -207,6 +284,15 @@
         <label>Seed (−1 — случайный)</label>
         <input type="number" id="seed" value="-1" step="1">
       </div>
+      <div>
+        <label>Драматургия</label>
+        <select id="arcSel" title="Правки авторского плана: темп по секциям, для burst — вокал финала на октаву выше">
+          <option value="" selected>нет</option>
+          <option value="build" title="Сдержанное начало, энергия растёт, пик — финальный припев">build ↗</option>
+          <option value="wave" title="Куплеты тихие, припевы громкие — чередование волн">wave 〰</option>
+          <option value="burst" title="Тихое начало, сдержанные куплеты, взрыв в финальном припеве">burst ✸</option>
+        </select>
+      </div>
     </div>
 
   </section>
@@ -215,549 +301,102 @@
     <div id="playerWrap">
       <div class="empty" id="playerEmpty">Выберите трек в истории — здесь появится карточка</div>
       <div id="trackInfo" hidden>
-        <div class="ttitle" id="tTitle"></div>
+        <div style="display:flex; align-items:center; gap:8px">
+          <div class="ttitle" id="tTitle" style="flex:1; min-width:0"></div>
+          <span class="iconbtn" id="tRepeat" title="Вернуть параметры этой записи в форму">↺ повторить</span>
+          <span class="iconbtn" id="tRename" title="Переименовать (только метка, файлы не трогаем)">✎ имя</span>
+        </div>
         <div class="tchips" id="tChips"></div>
         <audio id="player" controls preload="metadata"></audio>
+        <div style="display:flex; gap:8px; align-items:center; margin-top:6px">
+          <span class="iconbtn" id="pPrev" title="Предыдущий трек списка">‹</span>
+          <span class="iconbtn" id="pNext" title="Следующий трек списка">›</span>
+        </div>
         <div class="tblocks">
           <div class="tblock"><div class="tlabel">Стиль</div><div class="ttext" id="tStyle"></div></div>
           <div class="tblock" id="tVoiceBlock" hidden><div class="tlabel">Голос</div><div class="ttext" id="tVoice"></div></div>
           <div class="tblock"><div class="tlabel">Текст</div><div class="ttext lyrico" id="tLyrics"></div></div>
+          <div class="tblock" id="sectionsBlock" hidden>
+            <div class="tlabel">Секции трека — клик по секции = превью фрагмента (декод латентов)</div>
+            <div class="secstrip" id="secStrip"></div>
+            <audio id="previewAudio" controls style="margin-top:8px" hidden></audio>
+          </div>
+          <details class="tblock" id="metricsBlock" hidden>
+            <summary class="tlabel" style="cursor:pointer">Метрики (темп, тональность, динамика, полосы)</summary>
+            <div style="display:flex; gap:8px; align-items:center; margin:6px 0">
+              <select id="cmpSel" style="width:auto; flex:none"><option value="">сравнить с…</option></select>
+              <span class="hint" id="metricsHint"></span>
+            </div>
+            <div class="kv" id="metricsKv"></div>
+          </details>
+          <details class="tblock" id="dspBlock" hidden>
+            <summary class="tlabel" style="cursor:pointer">DSP — «стена» / «кассета» (ffmpeg)</summary>
+            <div style="display:flex; gap:8px; margin:6px 0">
+              <select id="dspChain" style="width:auto; flex:none"></select>
+              <span class="hint" id="dspNote" style="align-self:center"></span>
+            </div>
+            <div id="dspParams"></div>
+            <div class="row" style="margin-top:8px">
+              <span class="iconbtn" id="dspApply" style="text-align:center">Применить к треку</span>
+              <span class="iconbtn" id="dspPreview" style="text-align:center">Превью 15 с</span>
+            </div>
+            <div id="dspVariants" style="margin-top:8px"></div>
+          </details>
+          <details class="tblock" id="odBlock" hidden>
+            <summary class="tlabel" style="cursor:pointer">Овердаб — сыграть ещё партию поверх этого трека</summary>
+            <div class="hint" style="margin:6px 0 0">Дочерняя генерация по партитуре записи; после рендера автоматически смешивается с родителем (гейн ниже).</div>
+            <div class="tags" id="odChips" style="margin-top:6px"></div>
+            <textarea id="odStyle" rows="2" style="margin-top:6px" placeholder="Стиль партии: акустическая гитара, слайд…"></textarea>
+            <textarea id="odLyrics" rows="2" style="margin-top:6px" placeholder="Текст дублирующего вокала (пусто — как у родителя)"></textarea>
+            <div style="display:flex; gap:8px; align-items:center; margin-top:6px">
+              <span class="iconbtn" id="odLyricsFill">♪ текст этого трека</span>
+              <label style="margin:0; white-space:nowrap">гейн <b id="odGainVal">0.5</b></label>
+              <input type="range" id="odGain" min="0.1" max="1" step="0.05" value="0.5" style="flex:1">
+            </div>
+            <button class="btn ghost" id="odGo" style="width:100%">Сгенерировать овердаб</button>
+          </details>
           <div class="tblock"><div class="tlabel">Тех. информация</div><div class="ttext mono" id="tTech"></div></div>
         </div>
-        <div class="row" style="margin-top:12px">
+        <div class="row" style="margin-top:12px; flex-wrap:wrap">
           <a class="dl2" id="dlMp320" download>MP3 320k</a>
           <a class="dl2" id="dlMp48" download>MP3 48k</a>
           <a class="dl2" id="dlFlac" download>FLAC</a>
+          <a class="dl2" id="dlWav" download>WAV</a>
           <a class="dl2" id="dlAbc" download hidden>ABC</a>
+          <a class="dl2" id="dlOdMix" download hidden>микс овердаба</a>
           <span class="spacer"></span>
           <button class="btn del" id="tDelete" style="margin:0; width:auto; padding:8px 16px">Удалить запись</button>
         </div>
       </div>
     </div>
+    <input type="text" id="gSearch" placeholder="Поиск по названию, тексту, стилю…" style="margin-top:14px" hidden>
     <div id="gallery"></div>
   </section>
 </main>
 
-<script>
-const $ = id => document.getElementById(id);
-const STAGE_RU = {
-  queued: 'в очереди', 'план ABC': 'план: модель пишет ABC-нотацию песни',
-  'семантика': 'семантика: LM генерирует песню токен за токеном',
-  'акустические латенты': 'flow-matching: латенты акустики',
-  'VAE-декод': 'VAE: латенты → звук 48 кГц', done: 'готово',
-};
+<div class="modal-overlay" id="planOverlay">
+  <div class="modal">
+    <h3>План песни — ABC-нотация</h3>
+    <div class="hint" id="planStat"></div>
+    <textarea id="planAbc" rows="18" class="mono" spellcheck="false" style="margin-top:8px"></textarea>
+    <details style="margin-top:8px">
+      <summary class="hint" style="cursor:pointer">Шпаргалка по нотации</summary>
+      <div class="hint">
+        Заголовок: X: номер · T: название · M: тактовый размер · L:1/32 единица длительности · Q:1/4=темп · K: тональность.<br>
+        Голоса: строка «V: Vocal» / «V: Ins» переключает партию; «% имя» — метка секции (intro, verse, chorus…).<br>
+        Ноты: C D E F G A B, нижний регистр (c d e) — октава выше, запятая после — октава ниже; z — пауза;
+        цифра после ноты/паузы умножает длительность (C2 — вдвое длиннее); такты разделены «|»;
+        аккорд в кавычках — "Am". План можно править свободно: модель споёт что написано.
+      </div>
+    </details>
+    <div class="btnrow">
+      <button class="btn ghost" id="planClose">Закрыть</button>
+      <button class="btn" id="planRender">Рендер по этому ABC</button>
+    </div>
+  </div>
+</div>
 
-let pollTimer = null, currentListId = null;
-
-function fmtDur(s){ s = Math.round(s); return Math.floor(s/60)+':'+String(s%60).padStart(2,'0'); }
-function fmtSec(s){ return s>=90 ? fmtDur(s) : Math.round(s)+' с'; }
-
-// ---------- health ----------
-async function pollHealth(){
-  try {
-    const h = await (await fetch('/api/health')).json();
-    const m = $('chipModel'), ok = h.ready;
-    m.textContent = `модель: ${ok ? 'готова (bf16)' : (h.detail||'грузится')}`;
-    m.className = 'chip ' + (ok ? 'ok' : (h.detail||'').startsWith('ошибка') ? 'err' : '');
-    $('chipGpu').textContent = h.gpu ? `${h.gpu.split('NVIDIA ').pop()} · своб. ${h.vram_free_gb} ГБ` : 'gpu: —';
-    $('chipQueue').textContent = `очередь: ${h.queue}`;
-    if (!ok && !activeJobs.length) $('stLine').innerHTML = `<b>${h.detail||'загрузка…'}</b>`;
-    return h;
-  } catch { $('chipModel').textContent = 'сервер недоступен'; return null; }
-}
-
-// ---------- пресеты и голоса ----------
-const PRESETS = {
-  'фолк-метал': 'Russian folk metal, symphonic death metal. 180 BPM, dark battle energy. Arrangement: tremolo guitars and blast beats under accordion and zhaleika, choir stabs in the chorus, bass-drop before each refrain, folk melody intro on gusli.',
-  'симфо-готик': 'Gothic metal, symphonic metal, doom. 90 BPM, E minor, epic and tragic. Arrangement: heavy rhythm guitars, orchestral strings and choir pads, piano intro, dramatic build into a towering chorus, cathedral reverb.',
-  'нью-метал + электроника': 'Nu metal fused with dark metal and high-BPM electronic layers. 140 BPM. Arrangement: hypnotic one-note synth ostinato, down-tuned riffing, industrial percussion, glitch fills, whisper-to-scream dynamics.',
-  'индастриал-симфо': 'Symphonic industrial metal, cinematic orchestral. 130 BPM. Arrangement: martial drum machines, brass swells, distorted bass synth, orchestral breakdowns, cold futuristic menace, spoken-word intro through a vinyl filter.',
-  'панк 77': 'Raw 1977 punk rock. 170 BPM, fast and sneering. Arrangement: three buzzsaw chords, racing bare drums, shouted gang chorus, no solos, two minutes of pure spit.',
-  'хардкор/панк': 'Modern hardcore punk. 190 BPM, aggressive and desperate. Arrangement: d-beat drumming, metallic power-chord breaks, half-time mosh part in the middle, gang shouts, raw basement production.',
-  'детройт-техно': 'Detroit techno. 128 BPM, stark and hypnotic. Arrangement: rolling 909 kick, icy string stabs, acid bassline slowly opening the filter, minimal, machine soul, long DJ-style intro and outro.',
-  'мелодик-техно': 'Melodic techno, dark and driving. 122 BPM. Arrangement: pulsing bass offbeat, melancholic arpeggio growing over 8 bars, atmosphere pads, tight kick, festival drop in the middle, dreamy breakdown.',
-  'дарк-техно / EBM': 'Dark techno, EBM, warehouse. 135 BPM, cold and relentless. Arrangement: distorted analog kick, menacing bass sequence, metallic percussion, dystopian vocal stabs, no sunlight, hypnotic loop evolution.',
-  'фанк / ню-диско': 'Funk / nu-disco, 108 BPM, groovy and infectious. Confident female lead vocal with ad-libs. Slap bass, wah guitar, four-on-the-floor drums, brass stabs in the chorus, filter sweeps on the outro.',
-  'синти-поп 80-х': 'Synth-pop, 80s, 110 BPM, A minor, energetic neon-night mood. Soft female lead with light vocoder doubles in chorus. Analog synth bass, arpeggiated lead, gated drums, punchy chorus.',
-  'акустическая баллада': 'Acoustic pop ballad, 72 BPM, C major, warm and intimate. Soft female lead, close and breathy. Fingerpicked guitar, soft piano, brushed drums and upright bass enter in the chorus.',
-  'рок': 'Alternative rock, 128 BPM, E minor, driving and defiant. Raspy male lead, powerful belts in the chorus. Distorted rhythm guitars, driving bass, hard-hitting drums, guitar solo in the bridge.',
-  'рэп': 'Boom-bap hip-hop, 88 BPM, G minor, confident and gritty. Low male rap lead, tight flow, ad-libs in gaps; soulful female hook. Dusty drum breaks, upright piano loop, sub bass, vinyl crackle.',
-  'шансон по-русски': 'Russian chanson / city romance, 84 BPM, D minor, melancholic and nostalgic. Expressive male baritone with slight rasp. Acoustic guitar, accordion, upright bass, brushed snare, violin in the bridge.',
-};
-// Голоса — категории + подпись + краткое пояснение (тултип) + полный блок
-// Vocal Details по паттерну промпт-гайда (тембр, манера по секциям, гармонии, FX).
-const VOICES = {
-  'Женские': [
-    { label: 'пронзительный ваил', tip: 'Пронзительное драматическое сопрано: режущие верха, дикие выдержанные ваилы — хэви/пауэр-метал.',
-      text: 'Vocal Details: Singer A (Female), a piercing, dramatic rock soprano with a glass-cutting upper register and a wild, sustained wail. Verses ride a tense mid-range; the chorus explodes into stratospheric belts and screaming high notes held to the last bar. Doubles an octave up in the final chorus. Aggressive compression, bright EQ, long delay on the wails.' },
-    { label: 'рок-меццо с хрипотцой', tip: 'Мощное рок-меццо с виски-хрипотцой, ломающейся на верхах, — классика женского хард-рока.',
-      text: 'Vocal Details: Singer A (Female), a powerful rock mezzo with a whiskey rasp that breaks beautifully on the top notes. Sultry, defiant verses; a full-throated, chesty belt in the chorus. Raspy ad-libs between lines. Close and dry with a touch of analog saturation.' },
-    { label: 'готик-сопрано', tip: 'Тёмное симфоническое сопрано: холодный кристалл, оперные верха поверх стены гитар — готик-метал.',
-      text: 'Vocal Details: Singer A (Female), a dark symphonic metal soprano with classical training and a cold, crystalline tone. Chant-like, restrained verses; operatic high notes soaring over the wall of guitars in the chorus. Choir doubling and ghostly whispers underneath. Cathedral reverb, orchestral arrangement around the voice.' },
-    { label: 'фолк-метал сопрано', tip: 'Светлое скандинавское фолк-сопрано с кулинг-зовами в верхнем регистре — фолк/викинг-метал.',
-      text: 'Vocal Details: Singer A (Female), a clear Scandinavian-tinged folk-metal soprano with a bright, open ring and kulning-like call notes. Lullaby-soft verses over an acoustic intro; fierce, celebration-high choruses against blast beats. Folk harmonies in fifths in the chorus. Natural voice, live-room ambience.' },
-    { label: 'метал-скрим', tip: 'Женский экстрим-вокал: чёрные скримы в припевах, гроул на серединах, редкие чистые эхо-вставки.',
-      text: 'Vocal Details: Singer A (Female), a fierce extreme-metal vocalist: blackened high screams tearing through choruses, mid-range growls in the verses, sudden clean echoes as contrast. Layered screams panned wide. Heavily compressed, front-of-mix aggression.' },
-    { label: 'гранж-альт', tip: 'Сырой гранж-альт 90-х: надтреснутая эмоция, ленивый куплет, хриплый отчаянный припев.',
-      text: 'Vocal Details: Singer A (Female), a raw 90s grunge alto with a cracked, emotional edge and slurred, behind-the-beat phrasing. Apathetic mumbling verses detonating into a hoarse, desperate chorus. Doubles loose and slightly detuned. Lo-fi, dry, ugly-beautiful.' },
-    { label: 'хриплый рок-контральто', tip: 'Низкий контральто с гравием и дерзкой подачей — рок-н-ролльный свинг, виски и сигареты.',
-      text: 'Vocal Details: Singer A (Female), a low, whiskey-soaked rock contralto with gravel in the chest register and a sneering attitude. Swaggering verses, throaty sustained lows in the chorus, occasional fierce climbs. Tight dry mix, dirty tube saturation.' },
-    { label: 'тёплое меццо', tip: 'Нежное низкое женское, дыхтовое, близкий микрофон — идеал для баллад и инди.',
-      text: 'Vocal Details: Singer A (Female), a warm mezzo-soprano with a breathy low register. Intimate, close-miked delivery in the verses with clear diction; a gentle lift into the chorus. Light stacked harmonies in the chorus only. Restrained plate reverb, subtle saturation on sustained notes.' },
-    { label: 'яркое сопрано', tip: 'Молодое звонкое сопрано, режет микстейк; мощный бельтый припев — большой поп.',
-      text: 'Vocal Details: Singer A (Female), a bright, youthful soprano that cuts through the mix. Melodic and precise in the verses; powerful belted chorus with sustained notes. Multi-layered self-harmonies stacked in thirds in the choruses. Moderate reverb, delay throws, subtle pitch correction and compression in the chorus.' },
-    { label: 'глубокий альт', tip: 'Тёмный контральто на грудном регистре, смоковые низы — соул, лаунж, ночной вайб.',
-      text: 'Vocal Details: Singer A (Female), a dark, rich contralto with a heavy chest register and smoky lows. Confident, laid-back phrasing; soulful melisma at phrase ends. A single unison double in the chorus. Warm tape saturation, minimal reverb, intimate and dry.' },
-    { label: 'джазовый дым', tip: 'Хрипловатый джазовый вокал чуть позади доли, лёгкое вибрато — кабаре, нуар.',
-      text: 'Vocal Details: Singer A (Female), a smoky, husky jazz voice with behind-the-beat phrasing and loose vibrato. Conversational verses, gently soaring bridge. Late-night double in the final chorus, occasional low harmonies. Vintage ribbon-mic tone, tape hiss, plate reverb.' },
-    { label: 'эфирное сопрано', tip: 'Воздушное головное сопрано-шёпот, «оохи» и реверберационная дымка — дрим-поп.',
-      text: 'Vocal Details: Singer A (Female), an airy, ethereal soprano floating in head voice, whispery and weightless. Half-voice verses dissolving into wordless oohs; a shimmering high register in the chorus. Ghostly octave doubles throughout. Long cathedral reverb, subtle detune chorus effect.' },
-    { label: 'оперное сопрано', tip: 'Академическое лирическое сопрано: легато, контролируемое вибрато, высокие ноты — кроссовер.',
-      text: 'Vocal Details: Singer A (Female), a lyric operatic soprano with full classical technique, even legato lines and a controlled spin vibrato. Declamatory verses, soaring sustained high notes in the chorus. Choir-like harmonies in the finale. Hall acoustics, natural voice, minimal processing.' },
-    { label: 'R&B альт', tip: 'Шёлковый альт с мелизмами, фальцет-подъёмами и госпел-рунами — современный R&B.',
-      text: 'Vocal Details: Singer A (Female), a silky R&B alto with fluid melisma, breathy falsetto flips and gospel-tinged runs. Groove-locked verses, ad-libbed flourishes in the outro. Stacked harmonies answering the lead in the chorus. Warm compression, doubled lead on hooks, tasteful delay throws.' },
-    { label: 'панк-сорванец', tip: 'Дерзкий «пацанский» вокал с рычинкой, гэнг-крики в припеве — панк/гэрэдж.',
-      text: 'Vocal Details: Singer A (Female), a bratty, snarly punk delivery with a razor edge and clipped phrasing. Shouted gang-style choruses, spoken asides in the breakdown. Unison shouting doubles in the chorus. Raw and dry, light distortion on the mic, no pitch correction.' },
-    { label: 'фолк-распев', tip: 'Открытый народный распев с подголосками и мелизмами — русская фолк-традиция.',
-      text: 'Vocal Details: Singer A (Female), an open-throated Russian folk soprano with ornamental melisma and a bright, nasal-forward ring. Free-rhythm intro, steady rubato verses, celebratory extended notes in the chorus. Parallel fifths folk harmonies in the chorus. Natural voice, room ambience, no FX.' },
-    { label: 'рэп', tip: 'Острый женский рэп: чёткие согласные, синкопы, мелодичный хук на припеве.',
-      text: 'Vocal Details: Singer A (Female), a sharp, agile rap vocal with crisp consonants and playful cadence. Syncopated flow riding the beat in the verses; a melodic sung hook if a chorus is tagged. Call-and-response doubles in the hook. Upfront and dry.' },
-  ],
-  'Мужские': [
-    { label: 'пауэр-метал тенор', tip: 'Парящий пауэр-метал тенор: героические верха, бесконечное дыхание, финальная длинная нота.',
-      text: 'Vocal Details: Singer A (Male), a soaring power-metal tenor with heroic top notes, crystal diction and endless breath. Galloping rhythmic verses; triumphant high belts and a fist-raising final long note in the last chorus. Doubled in unison plus a high harmony. Bright, big, anthem reverb.' },
-    { label: 'бархатный баритон', tip: 'Мягкий низкий баритон с лёгкой хрипотцой на выдержках — соул, лаунж, шансон.',
-      text: 'Vocal Details: Singer A (Male), a velvety low baritone with a soft rasp on sustained notes. Calm, conversational phrasing in the verses; fuller chest voice in the chorus. A low octave double in the chorus. Short slap delay, warm tube saturation, minimal reverb.' },
-    { label: 'надрывный тенор', tip: 'Рок-тенор с надрывом: полушёпот в куплете, белтый припев — русский рок.',
-      text: 'Vocal Details: Singer A (Male), a raw, impassioned tenor with a gravelly edge under strain. Restrained half-voice verses breaking into a belted, sustained chorus. Unison doubles in the chorus, rough ad-libs in the gaps. Compressed and fairly dry with a touch of room reverb.' },
-    { label: 'глубокий бас', tip: 'Бас-профундо, могучие низы, неторопливые фразы — эпика, дарк-фолк, сказ.',
-      text: 'Vocal Details: Singer A (Male), a resonant basso profondo with grave, measured phrasing and rolling low notes. Narrating verses, solemn sustained lows under the chorus. A sepulchral octave-below double in the outro. Minimal processing, dark room reverb, chest-resonant proximity.' },
-    { label: 'чистый поп-тенор', tip: 'Гладкий «радио»-тенор с фирменной высокой нотой в припеве — мейнстрим-поп.',
-      text: 'Vocal Details: Singer A (Male), a clean, polished pop tenor with boyish warmth and agile phrasing. Light rhythmic verses, a bright open chorus with a signature high note. Tight two-part harmonies in the chorus. Radio-ready polish, mild autotune glide, wide reverb on hooks.' },
-    { label: 'инди-фальцет', tip: 'Интимный вокал с ломкой в хрупкий фальцет, лоу-фай подкладка — бедрум-поп.',
-      text: 'Vocal Details: Singer A (Male), an intimate indie voice flipping between a soft chest register and a fragile airy falsetto. Bedroom-close verses, falsetto soaring over the chorus. Lo-fi double, occasional whisper layer. Dry and close, tape wobble, no pitch correction.' },
-    { label: 'фолк-баритон', tip: 'Тёплый рассказчик с лёгкой хрипотцой — авторская песня, акустика, фолк.',
-      text: 'Vocal Details: Singer A (Male), a warm folk baritone with a storytelling lilt, light rasp and open vowels. Plaintive picked-guitar verses, a hearty raised chorus. Bare-bones delivery, one low harmony in the final chorus. Natural, dry, single-take feel.' },
-    { label: 'гроулинг + клин', tip: 'Экстрим-метал: чистые куплеты, гроул в припеве, скрим на бридже.',
-      text: 'Vocal Details: Singer A (Male), a versatile extreme-metal vocalist: clean, brooding verses; guttural growls driving the choruses; high screams accenting the bridge and outro. Layered growls in the chorus. Heavily compressed, mid-scooped, tight and dry.' },
-    { label: 'рэп', tip: 'Низкий уверенный рэп: плотный флоу, эд-либы в паузах — бум-бэп, трэп.',
-      text: 'Vocal Details: Singer A (Male), a low, confident rap vocal with tight flow and crisp articulation. Laid-back verse cadences; a sung hook if a chorus is tagged. Ad-libs in the gaps, occasional doubles on line ends. Upfront and dry, light saturation.' },
-  ],
-  'Ансамбли': [
-    { label: 'дуэт м+ж', tip: 'Он поёт куплет, она — припев; гармония вдвоём в финале.',
-      text: 'Vocal Details: a male-female duet. Singer A (Male), a warm baritone, leads the verses; Singer B (Female), a bright mezzo, answers and leads the chorus. Tight two-part harmony in the final chorus, trading lines in the bridge. Both close-miked, light plate reverb.' },
-    { label: 'госпел-хор', tip: 'Сольный вокал + хор в антифоне, хлопки в аутро — госпел, соул.',
-      text: 'Vocal Details: a lead vocal joined by a gospel choir. Singer A leads with impassioned, melismatic phrasing; the choir answers in call-and-response, swelling to full stacked harmonies in the chorus and hand-clapping backing in the outro. Room-filling choir ambience, natural dynamics.' },
-  ],
-  'Без вокала': [
-    { label: 'инструментал', tip: 'Вокала нет вообще: ведущую мелодию играет главный инструмент аранжировки.',
-      text: 'Instrumental: no vocals at all. The lead melodic role is carried by the main instrument of the arrangement, with instrumental solo lines where sung sections would be.' },
-  ],
-};
-const SECTIONS = ['[intro]','[verse]','[pre-chorus]','[chorus]','[verse 2]','[bridge]','[instrumental]','[solo]','[outro]'];
-
-for (const [name, text] of Object.entries(PRESETS)) {
-  const t = document.createElement('span'); t.className = 'tag'; t.textContent = name;
-  t.onclick = () => { $('style').value = text; };
-  $('stylePresets').appendChild(t);
-}
-
-// селектор голоса: табы категорий + скроллящийся список с тултипами
-let voiceTab = 'Женские', voiceSel = null;
-function renderVoiceTabs() {
-  const tabs = $('voiceTabs'); tabs.innerHTML = '';
-  for (const cat of Object.keys(VOICES)) {
-    const t = document.createElement('span');
-    t.className = 'vtab' + (cat === voiceTab ? ' active' : '');
-    t.textContent = cat;
-    t.onclick = () => { voiceTab = cat; renderVoiceTabs(); renderVoiceList(); };
-    tabs.appendChild(t);
-  }
-}
-function renderVoiceList() {
-  const list = $('voiceList'); list.innerHTML = '';
-  for (const v of VOICES[voiceTab]) {
-    const d = document.createElement('div');
-    d.className = 'vopt' + (voiceSel === v ? ' sel' : '');
-    d.dataset.tip = v.tip;
-    const label = document.createElement('span');
-    label.className = 'vlabel'; label.textContent = v.label;
-    const q = document.createElement('span');
-    q.className = 'q'; q.textContent = '?'; q.title = '';
-    d.appendChild(label); d.appendChild(q);
-    d.onclick = () => {
-      voiceSel = v;
-      $('voice').value = v.text;
-      renderVoiceList();
-    };
-    list.appendChild(d);
-  }
-}
-renderVoiceTabs();
-renderVoiceList();
-
-// тултип голосов: один элемент вне списка, position:fixed + высокий z-index;
-// триггер — значок «?» в строке
-const voiceTip = document.createElement('div');
-voiceTip.id = 'voiceTip';
-document.body.appendChild(voiceTip);
-$('voiceList').addEventListener('mouseover', e => {
-  const q = e.target.closest('.q');
-  if (!q) return;
-  const opt = q.closest('.vopt');
-  if (!opt || !opt.dataset.tip) return;
-  voiceTip.textContent = opt.dataset.tip;
-  voiceTip.style.display = 'block';
-  const r = q.getBoundingClientRect(), t = voiceTip.getBoundingClientRect();
-  let x = Math.min(r.left + r.width / 2 - 14, window.innerWidth - t.width - 12);
-  let y = r.top - t.height - 8;               // над строкой
-  if (y < 8) y = r.bottom + 8;                // не влезает сверху — снизу
-  voiceTip.style.left = x + 'px';
-  voiceTip.style.top = y + 'px';
-});
-$('voiceList').addEventListener('mouseout', e => {
-  if (!(e.relatedTarget && e.relatedTarget.closest && e.relatedTarget.closest('.q')))
-    voiceTip.style.display = 'none';
-});
-for (const s of SECTIONS) {
-  const t = document.createElement('span'); t.className = 'tag'; t.textContent = s;
-  t.onclick = () => {
-    const ta = $('lyrics');
-    const add = (ta.value && !ta.value.endsWith('\n') ? '\n' : '') + s + '\n';
-    ta.value += add; ta.focus();
-    ta.setSelectionRange(ta.value.length, ta.value.length);
-  };
-  $('secTags').appendChild(t);
-}
-// ---------- кавер по MIDI/аудио: сервер извлекает ноты (midi2abc, basic-pitch), ABC редактируем ----------
-const MIDI_HINT_DEFAULT = 'Загрузите .mid или аудио (mp3/wav/flac/…) — аудио разбирает SheetSage2 (родная транскрипция YuE2: голоса Vocal/Ins, секции, темп; при сбое — basic-pitch), ноты показываются в ABC, можно править. Режим плана станет melody.';
-let midiLoaded = false, midiBlobUrl = null;
-function resetMidi() {
-  midiLoaded = false;
-  $('midiFile').value = '';
-  $('midiResult').hidden = true;
-  $('midiHint').textContent = MIDI_HINT_DEFAULT;
-  if (midiBlobUrl) { URL.revokeObjectURL(midiBlobUrl); midiBlobUrl = null; }
-  $('midiDl').hidden = true;
-}
-$('midiClear').onclick = resetMidi;
-$('midiFile').onchange = async () => {
-  const f = $('midiFile').files[0];
-  if (!f) return;
-  const isAudio = !/\.(mid|midi)$/i.test(f.name);
-  $('midiHint').textContent = isAudio
-    ? `слушаю ${f.name} — извлекаю ноты (SheetSage2, до минуты)…`
-    : `конвертирую ${f.name}…`;
-  try {
-    const title = f.name.replace(/\.[^.]+$/, '');
-    const r = await fetch('/api/midi2abc?title=' + encodeURIComponent(title),
-                          { method: 'POST', body: await f.arrayBuffer() });
-    const j = await r.json().catch(() => ({}));
-    if (!r.ok) { resetMidi(); $('midiHint').innerHTML = `<span class="err">${j.detail || r.status}</span>`; return; }
-    midiLoaded = true;
-    $('abc').value = j.abc;
-    $('midiResult').hidden = false;
-    $('abcStat').textContent = j.transcribed
-      ? `${f.name} → ${j.engine === 'sheetsage2' ? 'SheetSage2' : 'basic-pitch'}: ${j.notes ?? '?'} нот → ABC: ${j.chars} символов`
-      : `${f.name} → ABC: ${j.chars} символов`;
-    if (j.thinned) $('abcStat').textContent += ' · партитура была слишком плотной, оставлена мелодия';
-    if (j.transcribed && j.midi_b64) {
-      const bytes = Uint8Array.from(atob(j.midi_b64), c => c.charCodeAt(0));
-      midiBlobUrl = URL.createObjectURL(new Blob([bytes], { type: 'audio/midi' }));
-      $('midiDl').href = midiBlobUrl;
-      $('midiDl').setAttribute('download', (title || 'cover') + '.mid');
-      $('midiDl').hidden = false;
-    }
-    $('midiHint').textContent = 'Модель споёт эти ноты (план не пишет). Полномиксовое аудио даёт густую партитуру — лучше вокал/мелодия по отдельности; лишнее можно вычистить в поле выше.';
-    if ($('cot').value === 'off') $('cot').value = 'melody';
-  } catch (e) { resetMidi(); $('midiHint').innerHTML = `<span class="err">сервер недоступен: ${e}</span>`; }
-};
-
-// ---------- generate: очередь задач (кнопка всегда активна) ----------
-let activeJobs = [];      // id в порядке отправки; первая — обрабатывается/показывается
-let jobStates = {};        // id -> последнее состояние
-let lastQueueError = null;
-
-$('go').onclick = async () => {
-  unlockNotify(); // жест пользователя — разблокировать звук уведомления
-  const style = $('style').value.trim();
-  const voice = $('voice').value.trim();
-  const lyrics = $('lyrics').value.trim();
-  if (style.length < 3) { $('stLine').innerHTML = '<span class="err">Опишите стиль (обязательно)</span>'; return; }
-  if (lyrics.length < 2) { $('stLine').innerHTML = '<span class="err">Вставьте лирику — по её объёму строится песня</span>'; return; }
-  const combined = voice ? style + '\n\n' + voice : style; // дубли на сервере, для чата
-  const cfg = $('cfg').value === '' ? null : parseFloat($('cfg').value);
-  const abc = midiLoaded ? $('abc').value.trim() : null;
-  let cot = $('cot').value;
-  if (abc && cot === 'off') { cot = 'melody'; $('cot').value = 'melody'; } // сервер отвергнет off+abc
-  const body = { style, voice, lyrics, title: $('title').value.trim(),
-                 cot, cfg_scale: cfg, seed: parseInt($('seed').value), abc };
-  try {
-    const r = await fetch('/api/generate', { method: 'POST',
-      headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
-    if (!r.ok) { const e = (await r.json()).detail; $('stLine').innerHTML = `<span class="err">${e}</span>`; return; }
-    const { id } = await r.json();
-    activeJobs.push(id);
-    jobStates[id] = { id, status: 'queued', stage: 'в очереди', tokens: 0, elapsed_s: 0 };
-    finalMsg = null; lastQueueError = null;
-    renderJobs();
-    if (!pollTimer) { pollTimer = setInterval(pollAll, 2000); }
-  } catch (e) { $('stLine').innerHTML = `<span class="err">сервер недоступен: ${e}</span>`; }
-};
-
-$('stop').onclick = async () => {
-  const id = activeJobs[0];
-  if (!id) return;
-  $('stLine').textContent = 'останавливаю…';
-  try { await fetch(`/api/jobs/${id}/cancel`, { method: 'POST' }); } catch {}
-};
-
-function setBar(p){ $('barFill').style.width = Math.max(2, Math.min(100, p)) + '%'; }
-
-async function pollAll() {
-  const shownId = activeJobs[0];
-  const results = await Promise.all(activeJobs.map(id =>
-    fetch('/api/jobs/' + id).then(r => r.json()).catch(() => null)));
-  const stillActive = [];
-  activeJobs.forEach((id, i) => {
-    const j = results[i];
-    if (!j) { stillActive.push(id); return; }     // сети моргнули — оставим
-    jobStates[id] = j;
-    if (j.status === 'done') {
-      notifyDone();
-      play(`/outputs/${encodeURIComponent(j.result.file)}`, j.result, false);
-      loadGallery();
-      if (id === shownId)
-        finalMsg = `<b>Готово</b> — ${j.result.duration_s} c аудио за ${fmtSec(j.result.total_s)}`;
-    }
-    else if (j.status === 'error') { lastQueueError = `задача ${id.slice(0,6)}: ${j.error}`; if (id === shownId) finalMsg = null; }
-    else stillActive.push(id);
-  });
-  activeJobs = stillActive;
-  renderJobs();
-  if (!activeJobs.length && pollTimer) { clearInterval(pollTimer); pollTimer = null; }
-}
-
-let finalMsg = null;
-
-function renderJobs() {
-  $('stop').style.display = activeJobs.length ? 'block' : 'none';
-  const ql = $('queueLine');
-  const waiting = activeJobs.length - 1;
-  let extra = waiting > 0 ? `в очереди ещё: ${waiting}` : '';
-  if (lastQueueError && activeJobs.length) extra += (extra ? ' · ' : '') + `⚠ ${lastQueueError}`;
-  ql.hidden = !extra; ql.textContent = extra;
-
-  const id = activeJobs[0];
-  if (!id) {
-    if (lastQueueError) { $('stLine').innerHTML = `<span class="err">${lastQueueError}</span>`; setBar(0); }
-    else if (finalMsg) { $('stLine').innerHTML = finalMsg; setBar(100); }
-    return;
-  }
-  const j = jobStates[id] || { status: 'queued', stage: 'в очереди' };
-  if (j.status === 'queued') { setBar(4); $('stLine').textContent = 'в очереди…'; return; }
-  const st = STAGE_RU[j.stage] || j.stage || '';
-  if (j.status === 'error') { setBar(0); $('stLine').innerHTML = `<span class="err">${j.error}</span>`; return; }
-  // бегущий прогресс: доля пройденных стадий + токены внутри семантики
-  const order = ['план ABC','семантика','акустические латенты','VAE-декод'];
-  const idx = order.indexOf(j.stage);
-  setBar(idx >= 0 ? 8 + idx*22 + Math.min(14, (j.tokens||0)/3000*14) : 5);
-  let line = `<b>${st}</b>`;
-  if (j.stage === 'семантика') {
-    line += `<br>токенов: ${j.tokens||0}`;
-    if (j.tok_per_s) line += ` · ${j.tok_per_s} ток/с`;
-  } else if (j.stage === 'план ABC' && j.tokens) line += `<br>символов нот: ${j.tokens}`;
-  if (j.elapsed_s) line += ` · прошло ${fmtSec(j.elapsed_s)}`;
-  $('stLine').innerHTML = line;
-}
-
-// ---------- player / track card / gallery ----------
-// короткое звуковое уведомление о готовности (Web Audio, без файлов);
-// AudioContext разблокируется кликом по «Сгенерировать»
-let notifyCtx = null;
-function unlockNotify() {
-  try {
-    notifyCtx = notifyCtx || new (window.AudioContext || window.webkitAudioContext)();
-    if (notifyCtx.state === 'suspended') notifyCtx.resume();
-  } catch {}
-}
-function notifyDone() {
-  try {
-    unlockNotify();
-    if (!notifyCtx || notifyCtx.state !== 'running') return;
-    const t = notifyCtx.currentTime;
-    const g = notifyCtx.createGain();
-    g.connect(notifyCtx.destination);
-    g.gain.setValueAtTime(0.0001, t);
-    g.gain.exponentialRampToValueAtTime(0.22, t + 0.02);
-    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.75);
-    [880, 1318.5].forEach((f, i) => {  // A5 → E6, «динь-динь» ~0.7 c
-      const o = notifyCtx.createOscillator();
-      o.type = 'sine';
-      o.frequency.value = f;
-      o.connect(g);
-      o.start(t + i * 0.16);
-      o.stop(t + i * 0.16 + 0.45);
-    });
-  } catch {}
-}
-
-let currentMeta = null;   // выбранная запись
-let onlyLiked = false;    // фильтр истории: только ★
-function fmtChips(m) {
-  const c = [fmtDur(m.duration_s), m.sample_rate + ' Гц'];
-  if (m.liked) c.push('★ нравится');
-  if (m.abc_file) c.push('кавер по MIDI');
-  if (m.cot && m.cot !== 'full') c.push('режим ' + m.cot);
-  if (m.cfg_scale) c.push('cfg ' + m.cfg_scale);
-  c.push('seed ' + m.seed);
-  if (m.peak_vram_gb) c.push('VRAM ' + m.peak_vram_gb + ' ГБ');
-  if (m.total_s) c.push('ген. ' + fmtSec(m.total_s));
-  if (m.ts) c.push(m.ts.slice(0, 16).replace('T', ' '));
-  return c;
-}
-
-function play(url, meta, autoplay) {
-  currentMeta = meta;
-  currentListId = url;
-  $('playerEmpty').style.display = 'none';
-  $('playerWrap').classList.add('ready');
-  $('trackInfo').hidden = false;
-
-  $('tTitle').textContent = meta.title || (meta.style_base || meta.style || '').split(/[.\n]/)[0];
-  $('tChips').innerHTML = fmtChips(meta).map(t => `<span class="chip">${t}</span>`).join('');
-  $('tStyle').textContent = meta.style_base || meta.style || '';
-  const vb = $('tVoiceBlock');
-  if (meta.voice) { vb.hidden = false; $('tVoice').textContent = meta.voice; } else vb.hidden = true;
-  $('tLyrics').textContent = meta.lyrics || '';
-
-  const stem = meta.file.replace(/\.flac$/, '');
-  // имя при скачивании: название песни, если задано (иначе серверный stem);
-  // вычищаем символы, недопустимые в именах файлов Windows
-  const dlBase = ((meta.title || '').replace(/[\\/:*?"<>|]+/g, ' ').trim() || stem);
-  const mp320 = `/api/outputs/${encodeURIComponent(meta.file)}/mp3`;
-  $('dlMp320').href = mp320;  $('dlMp320').setAttribute('download', dlBase + '.mp3');
-  $('dlMp48').href = mp320 + '?q=48'; $('dlMp48').setAttribute('download', dlBase + '.48k.mp3');
-  $('dlFlac').href = url;     $('dlFlac').setAttribute('download', dlBase + '.flac');
-  if (meta.abc_file) {
-    $('dlAbc').hidden = false;
-    $('dlAbc').href = `/outputs/${encodeURIComponent(meta.abc_file)}`;
-    $('dlAbc').setAttribute('download', dlBase + '.abc');
-  } else $('dlAbc').hidden = true;
-
-  const t = [];
-  t.push(`файл: ${meta.file}`);
-  if (meta.abc_chars) t.push(`партитура MIDI: ${meta.abc_chars} симв. ABC`);
-  if (meta.tokens) t.push(`токенов: ${meta.tokens}`);
-  if (meta.total_s) t.push(`время генерации: ${fmtSec(meta.total_s)}`);
-  if (meta.peak_vram_gb) t.push(`пик VRAM: ${meta.peak_vram_gb} ГБ`);
-  t.push(`длительность: ${meta.duration_s} c · ${meta.sample_rate} Гц FLAC`);
-  $('tTech').textContent = t.join('\n');
-
-  $('player').src = url;
-  if (autoplay) $('player').play().catch(()=>{});
-  markGalleryItem();
-}
-
-function markGalleryItem() {
-  for (const el of document.querySelectorAll('.gitem')) {
-    el.classList.toggle('playing', el.dataset.file === (currentMeta && currentMeta.file));
-  }
-}
-
-// сброс карточки трека (после удаления проигрываемой записи)
-function resetPlayer() {
-  currentMeta = null; currentListId = null;
-  $('player').removeAttribute('src'); $('player').load();
-  $('trackInfo').hidden = true;
-  $('playerWrap').classList.remove('ready');
-  $('playerEmpty').style.display = 'block';
-}
-
-$('tDelete').onclick = async () => {
-  if (!currentMeta) return;
-  const name = currentMeta.title || currentMeta.file;
-  if (!confirm(`Удалить «${name}»? Файлы будут стёрты безвозвратно.`)) return;
-  const stem = currentMeta.file.replace(/\.flac$/, '');
-  try {
-    const r = await fetch(`/api/gallery/${encodeURIComponent(stem)}`, { method: 'DELETE' });
-    if (!r.ok) { const e = await r.json(); alert('Не удалось удалить: ' + (e.detail || r.status)); return; }
-  } catch (e) { alert('Сервер недоступен: ' + e); return; }
-  resetPlayer();
-  loadGallery();
-};
-
-async function loadGallery(){
-  let items = [];
-  try { items = await (await fetch('/api/gallery')).json(); } catch { return; }
-  const likedCount = items.filter(i => i.liked).length;
-  if (onlyLiked) items = items.filter(i => i.liked);
-  const g = $('gallery'); g.innerHTML = '';
-  if (!items.length && !likedCount) return;
-  const h = document.createElement('div'); h.className = 'label ghdr';
-  h.textContent = onlyLiked ? 'История · понравилось' : 'История';
-  const f = document.createElement('span');
-  f.className = 'tag' + (onlyLiked ? ' on' : '');
-  f.textContent = `★ ${likedCount}`;
-  f.title = 'только понравившиеся';
-  f.onclick = () => { onlyLiked = !onlyLiked; loadGallery(); };
-  h.appendChild(f);
-  g.appendChild(h);
-  if (!items.length) {
-    const e = document.createElement('div'); e.className = 'hint';
-    e.textContent = 'Пока ничего не отмечено — нажмите ★ у трека в списке';
-    g.appendChild(e);
-    return;
-  }
-  for (const it of items) {
-    const d = document.createElement('div');
-    d.className = 'gitem';
-    d.dataset.file = it.file;
-    d.innerHTML = `<span class="gstar${it.liked ? ' liked' : ''}" title="понравилось">${it.liked ? '★' : '☆'}</span>` +
-      `<div class="gname"><div></div><div></div></div>` +
-      `<div class="dur">${it.duration_s} c</div>` +
-      `<span class="gdel" title="удалить запись">✕</span>`;
-    d.querySelector('.gname div').textContent = it.title || (it.style_base || it.style || '').split(/[.\n]/)[0];
-    d.querySelectorAll('.gname div')[1].textContent =
-      (it.lyrics||'').replace(/\[.*?\]/g,' ').trim().slice(0,80) || it.file;
-
-    d.querySelector('.gstar').onclick = async e => {
-      e.stopPropagation();
-      const stem = it.file.replace(/\.flac$/, '');
-      try {
-        const r = await fetch(`/api/gallery/${encodeURIComponent(stem)}/like`, { method: 'POST' });
-        if (!r.ok) return;
-        const j = await r.json();
-        it.liked = j.liked;
-        if (currentMeta && currentMeta.file === it.file) {
-          currentMeta.liked = j.liked;
-          $('tChips').innerHTML = fmtChips(currentMeta).map(t => `<span class="chip">${t}</span>`).join('');
-        }
-        loadGallery();
-      } catch {}
-    };
-
-    d.querySelector('.gdel').onclick = async e => {
-      e.stopPropagation();
-      const name = it.title || it.file;
-      if (!confirm(`Удалить «${name}»? Файлы будут стёрты безвозвратно.`)) return;
-      const stem = it.file.replace(/\.flac$/, '');
-      try {
-        const r = await fetch(`/api/gallery/${encodeURIComponent(stem)}`, { method: 'DELETE' });
-        if (!r.ok) { const e2 = await r.json(); alert('Не удалось удалить: ' + (e2.detail || r.status)); return; }
-      } catch (e2) { alert('Сервер недоступен: ' + e2); return; }
-      if (currentMeta && currentMeta.file === it.file) resetPlayer();
-      loadGallery();
-    };
-
-    d.onclick = () => play(it.audio_url || `/outputs/${encodeURIComponent(it.file)}`, it, true);
-    g.appendChild(d);
-  }
-  markGalleryItem();
-}
-
-pollHealth(); setInterval(pollHealth, 5000);
-loadGallery();
-</script>
+<script src="/static/stylelib.js"></script>
+<script src="/static/app.js"></script>
 </body>
 </html>

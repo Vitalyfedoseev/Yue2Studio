@@ -13,6 +13,7 @@ import json
 import os
 import queue
 import random
+import shutil
 import threading
 import time
 import uuid
@@ -22,6 +23,8 @@ from typing import Optional
 
 import numpy as np
 import torch
+
+import arc
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -79,6 +82,8 @@ SAMPLE_RATE = 48000
 # Контекст модели 24576 токенов общий; ~22k на песню ≈ 10–14 мин аудио,
 # пик VRAM при этом доходит до ~14 ГБ — система позволяет.
 MAX_SEM_TOKENS = int(os.environ.get("YUE2_MAX_TOKENS", "22000"))
+# Черновик: короткий рендер на прикидку (~15–20 с), как в yue-studio
+DRAFT_TOKENS = 450
 
 # транслитерация для имени файла из названия песни
 _TRANSLIT = {
@@ -132,6 +137,12 @@ ENGINE = YueEngine()
 QUEUE: "queue.Queue[str]" = queue.Queue()
 JOBS: dict = {}
 JOBS_LOCK = threading.Lock()
+# Одна GPU: генерация держит пайплайн всё время работы, план-only и превью
+# фрагментов пытаются взять этот же лок с таймаутом → 409 «занято»
+PIPE_LOCK = threading.Lock()
+
+# Кадров латентов YuE2 в секунду (срез превью считается в этих единицах)
+LATENT_HZ = 25.0
 
 
 def _set(jid: str, **kw):
@@ -150,7 +161,7 @@ def _run_job(job: dict):
         with JOBS_LOCK:
             return bool(JOBS[job["id"]].get("cancel"))
 
-    counters = {"phase": "план", "tokens": 0}
+    counters = {"phase": "план", "tokens": 0, "budget": 0}
 
     def on_token(*args):
         # бэкенд зовёт (token_phase, token); берём фазу и считаем токены
@@ -167,9 +178,14 @@ def _run_job(job: dict):
             elapsed = time.time() - t0
             tps = (counters["tokens"] - last) / 2 if elapsed > 2 else None
             last = counters["tokens"]
+            # честный процент есть только на семантике: токены/бюджет
+            pct = None
+            if counters["phase"] == "семантика" and counters["budget"] > 0:
+                pct = min(99, counters["tokens"] * 100 // counters["budget"])
             _set(
                 job["id"], stage=counters["phase"], tokens=counters["tokens"],
                 elapsed_s=round(elapsed, 1), tok_per_s=round(tps, 1) if tps else None,
+                pct=pct,
             )
             stop_watch.wait(2)
 
@@ -187,39 +203,52 @@ def _run_job(job: dict):
             kw["cfg_scale"] = job["cfg_scale"]
         if job.get("abc"):
             kw["abc"] = job["abc"]  # внешняя партитура: план-генерация пропускается
+        if job.get("arc"):
+            kw["style"] = arc.style_with_arc(kw["style"], job["arc"])
 
-        t1 = time.time()
-        plan = pipe.plan(**kw, on_token=on_token)
-        counters["phase"] = "семантика"
-        t2 = time.time()
-        _set(job["id"], stage="семантика", plan_s=round(t2 - t1, 1))
+        with PIPE_LOCK:
+            t1 = time.time()
+            plan = pipe.plan(**kw, on_token=on_token)
+            if job.get("arc"):
+                # драматургия правит авторский план (темпы по секциям, октава
+                # в финале у burst) — префикс пересобирается повторным планом
+                counters["phase"] = "arc-plan"
+                _set(job["id"], stage="arc-plan")
+                abc2 = arc.apply_arc(plan.abc, job["arc"])
+                plan = pipe.plan(**{**kw, "abc": abc2}, on_token=on_token)
+                counters["phase"] = "семантика"
+            t2 = time.time()
+            _set(job["id"], stage="семантика", plan_s=round(t2 - t1, 1))
 
-        from yue2.protocol import CONTEXT, Sampling
+            from yue2.protocol import CONTEXT, Sampling
 
-        # контекст 24576 общий: префикс (стиль+лирика+ABC-план) + песня ≤ CONTEXT;
-        # пайплайн не усекает молча — подгоняем бюджет под фактический префикс
-        budget = max(200, min(MAX_SEM_TOKENS, CONTEXT - len(plan.prefix) - 4))
-        if job.get("abc") and CONTEXT - len(plan.prefix) - 4 < 1000:
-            # длинный MIDI съедает контекст — песня вышла бы на 200 токенов;
-            # честная ошибка лучше, чем минута GPU и 5 секунд «песни»
-            raise ValueError(
-                f"партитура из MIDI занимает почти весь контекст модели "
-                f"({len(plan.prefix)}/{CONTEXT} ток.) — обрежьте MIDI или уменьшите лирику"
+            # контекст 24576 общий: префикс (стиль+лирика+ABC-план) + песня ≤ CONTEXT;
+            # пайплайн не усекает молча — подгоняем бюджет под фактический префикс
+            budget = max(200, min(MAX_SEM_TOKENS, CONTEXT - len(plan.prefix) - 4))
+            if job.get("draft"):
+                budget = min(budget, DRAFT_TOKENS)
+            counters["budget"] = budget
+            if job.get("abc") and CONTEXT - len(plan.prefix) - 4 < 1000:
+                # длинный MIDI съедает контекст — песня вышла бы на 200 токенов;
+                # честная ошибка лучше, чем минута GPU и 5 секунд «песни»
+                raise ValueError(
+                    f"партитура из MIDI занимает почти весь контекст модели "
+                    f"({len(plan.prefix)}/{CONTEXT} ток.) — обрежьте MIDI или уменьшите лирику"
+                )
+            semantic = pipe.generate_semantic(
+                plan, sampling=Sampling(max_tokens=budget),
+                cancelled=cancelled, on_token=on_token,
             )
-        semantic = pipe.generate_semantic(
-            plan, sampling=Sampling(max_tokens=budget),
-            cancelled=cancelled, on_token=on_token,
-        )
-        counters["phase"] = "акустические латенты"
-        t3 = time.time()
-        _set(job["id"], stage="акустические латенты", semantic_s=round(t3 - t2, 1))
+            counters["phase"] = "акустические латенты"
+            t3 = time.time()
+            _set(job["id"], stage="акустические латенты", semantic_s=round(t3 - t2, 1))
 
-        latents = pipe.synthesize(semantic, cancelled=cancelled)
-        counters["phase"] = "VAE-декод"
-        t4 = time.time()
-        _set(job["id"], stage="VAE-декод", synth_s=round(t4 - t3, 1))
+            latents = pipe.synthesize(semantic, cancelled=cancelled)
+            counters["phase"] = "VAE-декод"
+            t4 = time.time()
+            _set(job["id"], stage="VAE-декод", synth_s=round(t4 - t3, 1))
 
-        audio = pipe.decode(latents)
+            audio = pipe.decode(latents)
         peak_vram = torch.cuda.max_memory_allocated() / 2**30
 
         import soundfile as sf
@@ -228,6 +257,11 @@ def _run_job(job: dict):
         stem = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{slugify(title) + '-' if slugify(title) else ''}{job['id'][:8]}"
         flac_path = OUT / f"{stem}.flac"
         sf.write(flac_path, audio, SAMPLE_RATE, subtype="PCM_24")
+        # партитура и латенты — фундамент превью/овердаба/таймлайна;
+        # float16 вдвое легче (~2 МБ/мин), decode вернём во float32
+        (OUT / f"{stem}.score.abc").write_text(plan.abc, encoding="utf-8")
+        z = latents.detach().cpu().numpy() if hasattr(latents, "detach") else latents
+        np.save(OUT / f"{stem}.latent.npy", np.asarray(z, dtype=np.float16))
 
         meta = {
             "file": flac_path.name,
@@ -245,17 +279,31 @@ def _run_job(job: dict):
             "total_s": round(time.time() - t0, 1),
             "peak_vram_gb": round(peak_vram, 2),
             "ts": datetime.now().isoformat(timespec="seconds"),
+            "score_abc_file": f"{stem}.score.abc",
+            "latent_file": f"{stem}.latent.npy",
+            "arc": job.get("arc") or "",
+            "draft": bool(job.get("draft")),
         }
         if job.get("abc"):
             (OUT / f"{stem}.abc").write_text(job["abc"], encoding="utf-8")
             meta["abc_file"] = f"{stem}.abc"   # сама партитура не в мете — бывает >100 КБ
             meta["abc_chars"] = len(job["abc"])
+        if job.get("overdub_parent"):
+            # овердаб: смешиваем с родителем сразу, ребёнок остаётся и отдельно
+            meta["overdub_of"] = job["overdub_parent"]
+            try:
+                mixed = _mix_overdub(
+                    OUT / f"{job['overdub_parent']}.flac", flac_path,
+                    job.get("overdub_gain", 0.5), job["overdub_parent"])
+                meta["overdub_file"] = mixed["file"]
+            except Exception as e:  # noqa: BLE001 — неудачный микс не роняет джобу
+                meta["overdub_error"] = f"{type(e).__name__}: {e}"
         (OUT / f"{stem}.json").write_text(
             json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8"
         )
         _set(job["id"], status="done", stage="done", **{"result": meta})
     except InterruptedError:
-        _set(job["id"], status="error", error="остановлено пользователем")
+        _set(job["id"], status="canceled", error="остановлено пользователем")
     finally:
         stop_watch.set()
 
@@ -294,7 +342,11 @@ from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def lifespan(_app):
-    ENGINE.start_load()
+    if os.environ.get("YUE2_NO_MODEL"):
+        # тестовый режим: GPU не занимаем, генерация недоступна (503)
+        ENGINE.detail = "модель не грузится (YUE2_NO_MODEL=1)"
+    else:
+        ENGINE.start_load()
     threading.Thread(target=worker, daemon=True, name="job-worker").start()
     yield
 
@@ -314,6 +366,9 @@ class GenRequest(BaseModel):
         None, max_length=400_000,
         description="Готовая ABC-партитура (кавер по MIDI) — модель поёт её, план не пишет",
     )
+    draft: bool = Field(False, description="Черновик ~15–20 с (бюджет 450 токенов)")
+    arc: str = Field("", pattern="^(|build|wave|burst)$",
+                     description="Драматургия: правки темпа/октавы в авторском плане")
 
 
 @app.get("/api/health")
@@ -323,6 +378,12 @@ def health():
         free_b, _ = torch.cuda.mem_get_info()
         vram_free_gb = round(free_b / 2**30, 1)
     node = find_node()
+    try:
+        import librosa  # noqa: F401
+
+        metrics_ok = True
+    except ImportError:
+        metrics_ok = False
     return {
         "ready": ENGINE.pipe is not None and ENGINE.error is None,
         "detail": ENGINE.error or ENGINE.detail,
@@ -330,6 +391,7 @@ def health():
         "vram_free_gb": vram_free_gb,
         "queue": QUEUE.qsize(),
         "sampling_rate": SAMPLE_RATE,
+        "metrics_ok": metrics_ok,
         "midi2abc": {
             "ok": node is not None and MIDI2ABC_CLI.is_file(),
             "node": bool(node),
@@ -529,6 +591,10 @@ def generate(req: GenRequest):
     abc = (req.abc or "").strip()
     if abc and req.cot == "off":
         raise HTTPException(422, "внешняя партитура несовместима с cot=off — выберите melody или full")
+    if req.arc and abc:
+        raise HTTPException(422, "драматургия правит авторский план — с внешней партитурой несовместима")
+    if req.arc and req.cot == "off":
+        raise HTTPException(422, "драматургии нужен нотный план — выберите full или melody")
     jid = uuid.uuid4().hex[:12]
     style_base = req.style.strip()
     voice = req.voice.strip()
@@ -540,8 +606,8 @@ def generate(req: GenRequest):
             "title": req.title.strip()[:80],
             "lyrics": req.lyrics.strip(),
             "cot": req.cot, "cfg_scale": req.cfg_scale, "seed": req.seed,
-            "abc": abc or None,
-            "elapsed_s": 0.0, "tokens": 0, "tok_per_s": None,
+            "abc": abc or None, "arc": req.arc or "", "draft": req.draft,
+            "elapsed_s": 0.0, "tokens": 0, "tok_per_s": None, "pct": None,
             "cancel": False, "created": time.time(),
         }
     QUEUE.put(jid)
@@ -552,10 +618,391 @@ def generate(req: GenRequest):
 def cancel_job(jid: str):
     with JOBS_LOCK:
         job = JOBS.get(jid)
-    if job is None:
-        raise HTTPException(404, "задача не найдена")
-    job["cancel"] = True
+        if job is None:
+            raise HTTPException(404, "задача не найдена")
+        if job["status"] == "queued":
+            # ещё не стартовала — снимаем сразу, GPU не занимается
+            job.update(status="canceled", stage="отменена", error="отменена до запуска")
+        else:
+            job["cancel"] = True
     return {"ok": True}
+
+
+# ---------- plan-only: план без рендера (посмотреть/поправить ABC до генерации) ----------
+
+class PlanRequest(BaseModel):
+    style: str = Field(..., min_length=3)
+    voice: str = Field("", description="Отдельное описание голоса — клеится к стилю")
+    lyrics: str = Field(..., min_length=2)
+    cot: str = Field("full", pattern="^(full|melody|off)$")
+    seed: int = Field(-1, ge=-1)
+    arc: str = Field("", pattern="^(|build|wave|burst)$")
+
+
+@app.post("/api/plan")
+def plan_only(req: PlanRequest):
+    """ABC-план по стилю/лирике без рендера песни. Под PIPE_LOCK: план тоже
+    занимает GPU; при работающей генерации — 409."""
+    if ENGINE.error:
+        raise HTTPException(503, f"модель не загрузилась: {ENGINE.error}")
+    if not ENGINE.ready.is_set():
+        raise HTTPException(503, f"модель ещё грузится ({ENGINE.detail})")
+    if req.cot == "off":
+        raise HTTPException(422, "cot=off не пишет нотный план")
+    if not PIPE_LOCK.acquire(timeout=1):
+        raise HTTPException(409, "GPU занят генерацией — постройте план, когда очередь освободится")
+    try:
+        import abcparse
+
+        style_base = req.style.strip()
+        voice = req.voice.strip()
+        style = (style_base + "\n\n" + voice).strip() if voice else style_base
+        if req.arc:
+            style = arc.style_with_arc(style, req.arc)
+        seed = req.seed if req.seed >= 0 else random.randint(0, 2**31 - 1)
+        plan = ENGINE.pipe.plan(style=style, lyrics=req.lyrics.strip(), cot=req.cot, seed=seed)
+        abc_text = plan.abc
+        if req.arc:
+            abc_text = arc.apply_arc(abc_text, req.arc)
+        tl = abcparse.parse_abc(abc_text)
+        return {
+            "abc": abc_text,
+            "seconds": tl.get("duration_sec"),
+            "tokens": _estimate_abc_tokens(abc_text),
+            "seed": seed,
+        }
+    finally:
+        PIPE_LOCK.release()
+
+
+# ---------- таймлайн и превью готовых записей ----------
+
+def _clean_stem(stem: str) -> str:
+    import re
+
+    if not re.fullmatch(r"[\w.-]+", stem):
+        raise HTTPException(422, "недопустимое имя")
+    return stem[:-5] if stem.endswith(".flac") else stem
+
+
+def _rms_sections(flac: Path, bars: list) -> list:
+    """Средняя RMS (дБ) по смежным группам тактов одной секции — карта
+    громкости для ленты секций. soundfile+numpy, без librosa."""
+    import soundfile as sf
+
+    if not flac.is_file() or not bars:
+        return []
+    try:
+        data, sr = sf.read(str(flac), dtype="float32", always_2d=True)
+    except Exception:  # noqa: BLE001 — битый flac не должен ломать таймлайн
+        return []
+    mono = data.mean(axis=1)
+    total = len(mono) / sr
+    groups: list[dict] = []
+    for b in bars:
+        if groups and groups[-1]["section"] == b["section"]:
+            groups[-1]["end_sec"] = b["end_sec"]
+        else:
+            groups.append({"section": b["section"], "start_sec": b["start_sec"], "end_sec": b["end_sec"]})
+    out = []
+    for g in groups:
+        a = max(0.0, min(g["start_sec"], total))
+        z = min(total, max(a, g["end_sec"]))
+        if z - a < 0.05:
+            continue
+        seg = mono[int(a * sr):int(z * sr)]
+        rms = float(np.sqrt(np.mean(seg**2))) if seg.size else 0.0
+        out.append({**g, "rms_db": round(20 * np.log10(rms + 1e-9), 1)})
+    return out
+
+
+@app.get("/api/gallery/{stem}/score")
+def track_score(stem: str):
+    """Таймлайн партитуры (abcparse): такты/голоса/секции/секунды + rms_sections.
+    Кеш — outputs/<stem>.d/score.json."""
+    stem = _clean_stem(stem)
+    abc_path = OUT / f"{stem}.score.abc"
+    if not abc_path.is_file():
+        abc_path = OUT / f"{stem}.abc"      # кавер или старая запись без score
+    if not abc_path.is_file():
+        raise HTTPException(404, "партитура не найдена (запись без нотного плана)")
+    d = OUT / f"{stem}.d"
+    d.mkdir(exist_ok=True)
+    cache = d / "score.json"
+    if cache.is_file():
+        return json.loads(cache.read_text(encoding="utf-8"))
+    import abcparse
+
+    tl = abcparse.parse_abc(abc_path.read_text(encoding="utf-8"))
+    tl["rms_sections"] = _rms_sections(OUT / f"{stem}.flac", tl["bars"])
+    cache.write_text(json.dumps(tl, ensure_ascii=False), encoding="utf-8")
+    return tl
+
+
+class PreviewRequest(BaseModel):
+    from_sec: float = Field(..., ge=0)
+    to_sec: float = Field(...)
+
+
+@app.post("/api/gallery/{stem}/preview")
+def track_preview(stem: str, req: PreviewRequest):
+    """Превью фрагмента: срез латентов [from,to] сек → VAE-decode → flac
+    в outputs/<stem>.d/. Клэмп по длительности звука (ABC бывает длиннее)."""
+    stem = _clean_stem(stem)
+    latent = OUT / f"{stem}.latent.npy"
+    if not latent.is_file():
+        raise HTTPException(404, "латенты не сохранены — запись сделана до появления превью")
+    if ENGINE.error or ENGINE.pipe is None:
+        raise HTTPException(503, f"модель не готова: {ENGINE.error or ENGINE.detail}")
+    meta_path = OUT / f"{stem}.json"
+    duration = None
+    if meta_path.is_file():
+        try:
+            duration = json.loads(meta_path.read_text(encoding="utf-8")).get("duration_s")
+        except ValueError:
+            pass
+    z = np.load(latent)
+    total = duration if duration else len(z) / LATENT_HZ
+    f = max(0.0, min(req.from_sec, total - 1))
+    t = min(max(req.to_sec, f + 1), total)
+    if t - f < 1:
+        raise HTTPException(422, "фрагмент короче секунды")
+    if not PIPE_LOCK.acquire(timeout=1):
+        raise HTTPException(409, "GPU занят генерацией — превью недоступно, попробуйте позже")
+    try:
+        import soundfile as sf
+
+        a, b = int(f * LATENT_HZ), max(int(t * LATENT_HZ), int(f * LATENT_HZ) + 1)
+        audio = ENGINE.pipe.decode(z[a:b, :].astype(np.float32))
+        d = OUT / f"{stem}.d"
+        d.mkdir(exist_ok=True)
+        out = d / f"preview-{f:.0f}-{t:.0f}.flac"
+        sf.write(str(out), audio, SAMPLE_RATE, subtype="PCM_24")
+        return {
+            "file": f"{stem}.d/{out.name}",
+            "url": f"/outputs/{stem}.d/{out.name}",
+            "from_sec": round(f, 1), "to_sec": round(t, 1),
+            "seconds": round(t - f, 1),
+        }
+    finally:
+        PIPE_LOCK.release()
+
+
+# ---------- метрики ----------
+
+@app.post("/api/gallery/{stem}/analyze")
+def track_analyze(stem: str, fresh: bool = False):
+    """librosa-метрики записи (темп, тональность, динамика, полосы, стерео);
+    кеш — outputs/<stem>.d/metrics.json, ?fresh=true пересчитать."""
+    stem = _clean_stem(stem)
+    flac = OUT / f"{stem}.flac"
+    if not flac.is_file():
+        raise HTTPException(404, "запись не найдена")
+    d = OUT / f"{stem}.d"
+    cache = d / "metrics.json"
+    if cache.is_file() and not fresh:
+        return json.loads(cache.read_text(encoding="utf-8"))
+    try:
+        import audio_metrics
+    except ImportError:
+        raise HTTPException(503, "librosa не установлена — метрики недоступны")
+    try:
+        m = audio_metrics.analyze_file(flac)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(500, f"анализ не удался: {type(e).__name__}: {e}")
+    d.mkdir(exist_ok=True)
+    cache.write_text(json.dumps(m, ensure_ascii=False, indent=1), encoding="utf-8")
+    return m
+
+
+# ---------- DSP-цепочки (ffmpeg) ----------
+
+class DspRequest(BaseModel):
+    chain: str
+    params: dict = Field(default_factory=dict)
+    preview: bool = Field(False, description="Фрагмент с 20-й секунды, 15 с")
+
+
+@app.get("/api/dsp/chains")
+def dsp_chains_meta():
+    from dataclasses import asdict
+
+    import dsp_chains
+    return [{"id": c.id, "name": c.name, "note": c.note,
+             "params": [asdict(p) for p in c.params]} for c in dsp_chains.CHAINS]
+
+
+@app.get("/api/gallery/{stem}/dsp")
+def dsp_variants(stem: str):
+    """Список DSP-вариантов записи (с метриками, если считались)."""
+    stem = _clean_stem(stem)
+    d = OUT / f"{stem}.d"
+    variants = []
+    if d.is_dir():
+        for p in sorted(d.glob("dsp-*.flac")):
+            item = {"file": f"{stem}.d/{p.name}", "url": f"/outputs/{stem}.d/{p.name}"}
+            m = p.with_name(p.name + ".metrics.json")
+            if m.is_file():
+                try:
+                    item["metrics"] = json.loads(m.read_text(encoding="utf-8"))
+                except ValueError:
+                    pass
+            variants.append(item)
+    return {"variants": variants}
+
+
+@app.post("/api/gallery/{stem}/dsp")
+def dsp_apply(stem: str, req: DspRequest):
+    """Прогнать цепочку (wall/wall-lite/tape) по FLAC записи; результат —
+    outputs/<stem>.d/dsp[-preview]-<chain>.flac + метрики варианта."""
+    stem = _clean_stem(stem)
+    flac = OUT / f"{stem}.flac"
+    if not flac.is_file():
+        raise HTTPException(404, "запись не найдена")
+    import dsp_chains
+
+    name = f"dsp-preview-{req.chain}.flac" if req.preview else f"dsp-{req.chain}.flac"
+    d = OUT / f"{stem}.d"
+    d.mkdir(exist_ok=True)
+    dst = d / name
+    try:
+        merged = dsp_chains.run_chain(
+            flac, dst, req.chain, req.params,
+            span=(dsp_chains.PREVIEW_START, dsp_chains.PREVIEW_DUR) if req.preview else None,
+        )
+    except KeyError as e:
+        raise HTTPException(422, str(e))
+    except RuntimeError as e:
+        raise HTTPException(500, f"ffmpeg: {e}")
+    metrics = None
+    try:
+        import audio_metrics
+
+        metrics = audio_metrics.analyze_file(dst)
+        (d / f"{name}.metrics.json").write_text(
+            json.dumps(metrics, ensure_ascii=False, indent=1), encoding="utf-8")
+    except Exception:  # noqa: BLE001 — вариант валиден и без метрик
+        pass
+    return {"file": f"{stem}.d/{name}", "url": f"/outputs/{stem}.d/{name}",
+            "params": merged, "metrics": metrics}
+
+
+# ---------- овердаб: дочерняя генерация по партитуре родителя ----------
+
+def _mix_overdub(parent_flac: Path, child_flac: Path, gain: float, parent_stem: str) -> dict:
+    """Смешать родителя и овердаб (как в yue-studio): gain на дубль, 50-мс
+    кроссфейд на обрезе, пик-нормализация; файл в <parent>.d/."""
+    import soundfile as sf
+
+    a, sr = sf.read(str(parent_flac), dtype="float32", always_2d=True)
+    b, b_sr = sf.read(str(child_flac), dtype="float32", always_2d=True)
+    if b_sr != sr:
+        raise ValueError(f"частоты записей не совпали: {sr} vs {b_sr}")
+    n = max(len(a), len(b))
+    mix = np.zeros((n, a.shape[1]), dtype=np.float32)
+    mix[:len(a)] += a
+    mb = np.zeros((n, a.shape[1]), dtype=np.float32)
+    mb[:min(len(b), n)] = b[:n]
+    mix[:len(mb)] += mb * gain
+    fade = min(int(0.05 * sr), n)
+    if fade:
+        mix[-fade:] *= np.linspace(1, 0, fade)[:, None]
+    peak = float(np.abs(mix).max())
+    if peak > 1.0:
+        mix /= peak
+    d = OUT / f"{parent_stem}.d"
+    d.mkdir(exist_ok=True)
+    out = d / f"overdub-{child_flac.stem}.flac"
+    sf.write(str(out), mix, sr, subtype="PCM_24")
+    return {"file": f"{parent_stem}.d/{out.name}", "url": f"/outputs/{parent_stem}.d/{out.name}"}
+
+
+class OverdubRequest(BaseModel):
+    style: str = Field(..., min_length=3, description="Стиль дублирующей партии")
+    lyrics: str = Field("", description="Пусто — берётся лирика родителя")
+    gain: float = Field(0.5, ge=0.05, le=1.0)
+    seed: int = Field(-1, ge=-1)
+    title: str = Field("")
+
+
+@app.post("/api/gallery/{stem}/overdub")
+def track_overdub(stem: str, req: OverdubRequest):
+    """Овердаб: джоба-потомок по score.abc родителя (или .abc кавера);
+    после рендера автоматически смешивается с родителем (gain)."""
+    stem = _clean_stem(stem)
+    abc_path = OUT / f"{stem}.score.abc"
+    if not abc_path.is_file():
+        abc_path = OUT / f"{stem}.abc"
+    if not abc_path.is_file():
+        raise HTTPException(404, "у записи нет партитуры — овердаб невозможен")
+    if ENGINE.error:
+        raise HTTPException(503, f"модель не загрузилась: {ENGINE.error}")
+    lyrics = req.lyrics.strip()
+    if not lyrics:
+        meta_path = OUT / f"{stem}.json"
+        if meta_path.is_file():
+            try:
+                lyrics = (json.loads(meta_path.read_text(encoding="utf-8"))
+                          .get("lyrics") or "").strip()
+            except ValueError:
+                pass
+    if len(lyrics) < 2:
+        raise HTTPException(422, "нет лирики ни в запросе, ни у родителя")
+    abc_text = abc_path.read_text(encoding="utf-8").strip()
+    jid = uuid.uuid4().hex[:12]
+    style_base = req.style.strip()
+    title = (req.title.strip() or f"овердаб · {stem}")[:80]
+    with JOBS_LOCK:
+        JOBS[jid] = {
+            "id": jid, "status": "queued", "stage": "в очереди",
+            "style": style_base, "style_base": style_base, "voice": "",
+            "title": title, "lyrics": lyrics,
+            "cot": "melody", "cfg_scale": None, "seed": req.seed,
+            "abc": abc_text, "arc": "", "draft": False,
+            "overdub_parent": stem, "overdub_gain": req.gain,
+            "elapsed_s": 0.0, "tokens": 0, "tok_per_s": None, "pct": None,
+            "cancel": False, "created": time.time(),
+        }
+    QUEUE.put(jid)
+    return {"id": jid, "parent": stem}
+
+
+# ---------- переименование (только мета, файлы не трогаем) ----------
+
+class RenameRequest(BaseModel):
+    title: str = Field(..., min_length=1)
+
+
+@app.post("/api/gallery/{stem}/rename")
+def rename_track(stem: str, req: RenameRequest):
+    stem = _clean_stem(stem)
+    meta_path = OUT / f"{stem}.json"
+    if not meta_path.is_file():
+        raise HTTPException(404, "запись не найдена")
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta["title"] = req.title.strip()[:80]
+    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8")
+    return {"title": meta["title"]}
+
+
+@app.get("/api/outputs/{name}/wav")
+def to_wav(name: str):
+    """Конвертация готового FLAC в WAV (PCM 16-bit), с кешем <stem>.wav."""
+    import re
+    import subprocess
+
+    if not re.fullmatch(r"[\w.-]+\.flac", name):
+        raise HTTPException(422, "имя файла должно быть <имя>.flac")
+    flac = OUT / name
+    if not flac.is_file():
+        raise HTTPException(404, "файл не найден")
+    wav = OUT / (Path(name).stem + ".wav")
+    if not wav.is_file():
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", str(flac), "-codec:a", "pcm_s16le", str(wav)],
+            check=True, capture_output=True,
+        )
+    return FileResponse(wav, filename=wav.name, media_type="audio/wav")
 
 
 @app.get("/api/outputs/{name}/mp3")
@@ -584,18 +1031,23 @@ def to_mp3(name: str, q: int = 320):
 
 @app.delete("/api/gallery/{stem}")
 def delete_track(stem: str):
-    """Удаление записи: flac + json + кеш mp3. stem — имя без расширения или .flac."""
+    """Удаление записи: flac + json + кеш mp3 + партитура + латенты + производные
+    (outputs/<stem>.d/ — превью, DSP-варианты, овердабы, кеши метрик)."""
     import re
 
     if not re.fullmatch(r"[\w.-]+", stem):
         raise HTTPException(422, "недопустимое имя")
     stem = stem[:-5] if stem.endswith(".flac") else stem
     removed = []
-    for suf in (".flac", ".json", ".mp3", ".48k.mp3", ".abc"):
+    for suf in (".flac", ".json", ".mp3", ".48k.mp3", ".abc", ".score.abc", ".latent.npy", ".wav"):
         p = OUT / f"{stem}{suf}"
         if p.is_file():
             p.unlink()
             removed.append(p.name)
+    d = OUT / f"{stem}.d"
+    if d.is_dir():
+        shutil.rmtree(d)
+        removed.append(f"{d.name}/")
     if not removed:
         raise HTTPException(404, "запись не найдена")
     return {"ok": True, "removed": removed}
