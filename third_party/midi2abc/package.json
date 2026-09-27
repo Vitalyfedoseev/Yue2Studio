@@ -1,0 +1,9 @@
+{
+  "name": "midi2abc-vendored",
+  "private": true,
+  "type": "module",
+  "description": "marmooo/midi2abc (MIT), vendored for yue2-web: MIDI → ABC converter",
+  "dependencies": {
+    "midi-file": "^1.2.4"
+  }
+}
