@@ -325,7 +325,7 @@ let activeJobs = [];      // id в порядке отправки; первая
 let jobStates = {};        // id -> последнее состояние
 let lastQueueError = null;
 
-async function submit(draft = false, fanN = 1) {
+async function submit(draft = false) {
   unlockNotify(); // жест пользователя — разблокировать звук уведомления
   let style = $('style').value.trim();
   // словарь ru→en: известные слова заменяем молча, неизвестные — предупреждаем
@@ -355,31 +355,26 @@ async function submit(draft = false, fanN = 1) {
   if (abc && cot === 'off') { cot = 'melody'; $('cot').value = 'melody'; } // сервер отвергнет off+abc
   let arcSel = $('arcSel') ? $('arcSel').value : '';
   if (abc && arcSel) { arcSel = ''; $('arcSel').value = ''; } // драматургия не работает с внешней партитурой
-  const n = Math.max(1, Math.min(8, fanN || 1));
-  // веер: базовый сид (случайный при -1) + i; одинаковая форма, разные траектории
+  // seed=-1/некорректный отправляем как есть: случайный выберет сервер
   const raw = parseInt($('seed').value);
-  const root = (Number.isNaN(raw) || raw < 0) ? Math.floor(Math.random() * 2 ** 31) : raw;
-  for (let i = 0; i < n; i++) {
-    const title = $('title').value.trim() + (n > 1 ? ` [${i + 1}/${n}]` : '');
-    const body = { style, voice, lyrics, title, cot, cfg_scale: cfg,
-                   seed: root + i, abc, draft, arc: arcSel };
-    try {
-      const r = await fetch('/api/generate', { method: 'POST',
-        headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
-      if (!r.ok) { const j = await r.json().catch(() => ({})); $('stLine').innerHTML = `<span class="err">${errText(j, r.status)}</span>`; return; }
-      const { id } = await r.json();
-      activeJobs.push(id);
-      jobStates[id] = { id, status: 'queued', stage: 'в очереди', tokens: 0, elapsed_s: 0 };
-    } catch (e) { $('stLine').innerHTML = `<span class="err">сервер недоступен: ${e}</span>`; return; }
-  }
+  const seed = (Number.isNaN(raw) || raw < 0) ? -1 : raw;
+  const body = { style, voice, lyrics, title: $('title').value.trim(), cot, cfg_scale: cfg,
+                 seed, abc, draft, arc: arcSel };
+  try {
+    const r = await fetch('/api/generate', { method: 'POST',
+      headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
+    if (!r.ok) { const j = await r.json().catch(() => ({})); $('stLine').innerHTML = `<span class="err">${errText(j, r.status)}</span>`; return; }
+    const { id } = await r.json();
+    activeJobs.push(id);
+    jobStates[id] = { id, status: 'queued', stage: 'в очереди', tokens: 0, elapsed_s: 0 };
+  } catch (e) { $('stLine').innerHTML = `<span class="err">сервер недоступен: ${e}</span>`; return; }
   finalMsg = null; lastQueueError = null;
   renderJobs();
   if (!pollTimer) { pollTimer = setInterval(pollAll, 2000); }
 }
 
-$('go').onclick = () => submit(false, 1);
-$('goDraft').onclick = () => submit(true, 1);
-$('goFan').onclick = () => submit(false, parseInt($('fanN').value));
+$('go').onclick = () => submit(false);
+$('goDraft').onclick = () => submit(true);
 
 $('stop').onclick = async () => {
   if (!activeJobs.length) return;

@@ -84,15 +84,11 @@
   }
   .btn:disabled { opacity: .45; cursor: default; }
   .btn.stop { background: linear-gradient(135deg, #b33951, #ff6b7a); margin-top: 8px; display: none; }
-  .btnrow { display: flex; gap: 8px; margin-top: 16px; flex-wrap: wrap; }
-  .btnrow .btn { margin-top: 0; }
-  .btnrow .btn:first-child { flex: 1 1 170px; }   /* главная кнопка тянется, остальное переносится */
+  .btnrow { display: flex; gap: 8px; margin-top: 16px; }
+  .btnrow .btn { margin-top: 0; flex: 1; padding: 9px 8px; font-size: 13px;
+    white-space: nowrap; }
   .btn.ghost { background: var(--panel2); border: 1px solid var(--border); color: var(--text); }
   .btn.ghost:hover { border-color: var(--accent); }
-  .btn.fan { display: flex; align-items: center; gap: 5px; flex: none; padding: 12px 10px; }
-  .btn.fan select { width: auto; padding: 2px 4px; background: transparent; border: none;
-    color: inherit; font: inherit; }
-  .btn.fan select option { color: var(--text); background: var(--panel2); }
   /* ряд режимов (план/guidance/seed/драматургия): 2×2 на узкой колонке */
   .row4 { display: flex; gap: 10px; flex-wrap: wrap; }
   .row4 > div { flex: 1 1 46%; min-width: 130px; }
@@ -216,9 +212,8 @@
     </div>
     <div class="btnrow">
       <button class="btn" id="go">Сгенерировать песню</button>
-      <button class="btn ghost" id="goDraft" title="Короткий рендер ~15–20 с на прикидку стиля/лирики">Черновик</button>
-      <button class="btn ghost fan" id="goFan" title="Несколько вариантов подряд: сиды base+0..N-1">×<select id="fanN"><option>2</option><option selected>5</option><option>8</option></select></button>
-      <button class="btn ghost" id="goPlan" title="Построить ABC-план без рендера: посмотреть, поправить, отрендерить по нему">План ABC</button>
+      <button class="btn ghost" id="goDraft" title="Короткий рендер ~15–20 с на прикидку стиля/лирики">Draft</button>
+      <button class="btn ghost" id="goPlan" title="Построить ABC-план без рендера: посмотреть, поправить, отрендерить по нему">ABC</button>
     </div>
     <button class="btn stop" id="stop">Остановить генерацию</button>
 
@@ -316,11 +311,11 @@
           <div class="tblock"><div class="tlabel">Стиль</div><div class="ttext" id="tStyle"></div></div>
           <div class="tblock" id="tVoiceBlock" hidden><div class="tlabel">Голос</div><div class="ttext" id="tVoice"></div></div>
           <div class="tblock"><div class="tlabel">Текст</div><div class="ttext lyrico" id="tLyrics"></div></div>
-          <div class="tblock" id="sectionsBlock" hidden>
-            <div class="tlabel">Секции трека — клик по секции = превью фрагмента (декод латентов)</div>
+          <details class="tblock" id="sectionsBlock" hidden>
+            <summary class="tlabel" style="cursor:pointer">Секции трека — клик по секции = превью фрагмента (декод латентов)</summary>
             <div class="secstrip" id="secStrip"></div>
             <audio id="previewAudio" controls style="margin-top:8px" hidden></audio>
-          </div>
+          </details>
           <details class="tblock" id="metricsBlock" hidden>
             <summary class="tlabel" style="cursor:pointer">Метрики (темп, тональность, динамика, полосы)</summary>
             <div style="display:flex; gap:8px; align-items:center; margin:6px 0">
