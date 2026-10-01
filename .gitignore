@@ -36,3 +36,5 @@ Thumbs.db
 
 # Примечание: yue2_infer-*.whl (66 КБ) сознательно версионируется —
 # это vendored-зависимость для воспроизводимости окружения.
+# Саундфонты ABC-редактора (54 МБ нот) — стягиваются scripts/fetch_soundfonts.sh
+static/vendor/abcjs/soundfonts/

@@ -715,3 +715,12 @@ def test_plan_without_model_503():
 
 def test_delete_missing_404():
     assert client.delete("/api/gallery/zztest-nothing").status_code == 404
+
+
+def test_pages_served():
+    for path, marker in (("/", "Music Studio"), ("/studio", "Студия"), ("/abc", "ABC-редактор")):
+        r = client.get(path)
+        assert r.status_code == 200, path
+        assert marker in r.text, path
+    r = client.get("/static/vendor/abcjs/abcjs-basic-min.js")
+    assert r.status_code == 200 and "abcjs" in r.text[:200]

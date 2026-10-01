@@ -2055,5 +2055,11 @@ def studio():
     return FileResponse(BASE / "static" / "studio.html")
 
 
+@app.get("/abc")
+def abc_editor():
+    """Автономный ABC-редактор: текст, ноты, проигрывание — без привязки к песне."""
+    return FileResponse(BASE / "static" / "abc.html")
+
+
 app.mount("/outputs", StaticFiles(directory=OUT), name="outputs")
 app.mount("/static", StaticFiles(directory=BASE / "static"), name="static")

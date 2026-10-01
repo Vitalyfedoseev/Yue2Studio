@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ABC-редактор · YuE2-3B</title>
+<style>
+  :root {
+    --bg: #0e1014; --panel: #161923; --panel2: #1c2030; --border: #272c3d;
+    --text: #e8eaf2; --muted: #8b91a8; --accent: #7c6cff; --accent2: #9d8bff;
+    --ok: #3ddc97; --err: #ff6b7a; --warn: #ffcc66;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 "Inter", "Segoe UI", system-ui, sans-serif; }
+  header {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    padding: 12px 20px; border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; background: rgba(14,16,20,.92); backdrop-filter: blur(6px); z-index: 5;
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 650; letter-spacing: .2px; }
+  a.home { text-decoration: none; color: var(--muted); }
+  a.home:hover { color: var(--text); }
+  .chip { font-size: 12px; padding: 3px 10px; border-radius: 99px;
+    border: 1px solid var(--border); color: var(--muted); white-space: nowrap; }
+  .chip.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 35%, transparent); }
+  .chip.err { color: var(--err); border-color: color-mix(in srgb, var(--err) 35%, transparent); }
+  .spacer { flex: 1; }
+
+  main { display: grid; grid-template-columns: 460px minmax(0, 1fr); gap: 16px;
+    padding: 16px 20px 40px; max-width: 1700px; margin: 0 auto; align-items: start; }
+  @media (max-width: 1100px) { main { grid-template-columns: 1fr; } }
+
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 14px 16px; min-width: 0; }
+  .tlabel { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .6px; }
+  .hint { font-size: 12px; color: var(--muted); margin-top: 4px; }
+  .err { color: var(--err); white-space: pre-wrap; }
+  .mono { font-family: ui-monospace, "JetBrains Mono", Consolas, monospace; }
+  textarea {
+    width: 100%; background: var(--panel2); color: var(--text);
+    border: 1px solid var(--border); border-radius: 9px; padding: 9px 11px;
+    font: inherit; outline: none; resize: vertical;
+  }
+  textarea:focus { border-color: var(--accent); }
+  textarea.mono { font-family: ui-monospace, "JetBrains Mono", Consolas, monospace; font-size: 12.5px; line-height: 1.55; }
+  details.panel > summary { cursor: pointer; list-style: none; }
+  details.panel > summary::-webkit-details-marker { display: none; }
+  details.panel > summary .tlabel { display: flex; align-items: center; gap: 6px; }
+  details.panel > summary .tlabel::before { content: '▸'; color: var(--accent2); transition: transform .15s; }
+  details.panel[open] > summary .tlabel::before { transform: rotate(90deg); }
+
+  .iconbtn { flex: none; cursor: pointer; color: var(--muted); padding: 5px 10px;
+    border-radius: 8px; border: 1px solid var(--border); background: var(--panel2);
+    font-size: 13px; user-select: none; text-decoration: none; display: inline-block; }
+  .iconbtn:hover { color: var(--text); border-color: var(--accent); }
+  .iconbtn.on { color: var(--accent2); border-color: var(--accent); }
+  .iconbtn:disabled { opacity: .4; cursor: default; }
+  .btnrow { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; align-items: center; }
+
+  .menu { position: relative; }
+  .menu .drop { position: absolute; left: 0; top: calc(100% + 6px); display: none;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 6px; min-width: 250px; z-index: 50; box-shadow: 0 6px 24px rgba(0,0,0,.45); }
+  .menu.open .drop { display: block; }
+  .menu .drop a { display: block; padding: 7px 10px; border-radius: 7px; cursor: pointer;
+    color: var(--text); text-decoration: none; font-size: 13px; white-space: nowrap; }
+  .menu .drop a:hover { background: var(--panel2); }
+
+  /* транспорт */
+  .transport { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  #btnPlay { min-width: 38px; text-align: center; }
+  #tTime { font-size: 12.5px; color: var(--muted); min-width: 96px; text-align: center; }
+  #tempoSel { width: auto; flex: none; background: var(--panel2); color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px; padding: 4px 8px; font: inherit; font-size: 13px; outline: none; }
+  .bar { flex: 1 1 130px; height: 8px; background: var(--panel2); border-radius: 99px;
+    overflow: hidden; cursor: pointer; min-width: 100px; }
+  .bar i { display: block; height: 100%; width: 0%;
+    background: linear-gradient(90deg, var(--accent), var(--accent2)); }
+
+  /* ноты */
+  #sheetBox { margin-top: 12px; max-height: calc(100vh - 230px); min-height: 220px;
+    overflow: auto; background: var(--panel2); border-radius: 10px; padding: 10px 12px; }
+  #sheet { min-height: 200px; }
+  #sheet svg { display: block; }
+  #sheetEmpty { color: var(--muted); text-align: center; padding: 70px 10px; font-size: 13px; }
+  #sheetErr { color: var(--err); font-size: 13px; padding: 10px; white-space: pre-wrap; }
+
+  /* миди-клавиатура */
+  #kbWrap { margin-top: 10px; user-select: none; -webkit-user-select: none; }
+  #kbKeys { position: relative; height: 92px; border-radius: 9px; overflow: hidden;
+    background: var(--panel2); border: 1px solid var(--border); touch-action: none; }
+  #kb .wk { position: absolute; top: 0; bottom: 0; background: #e9ecf5; border: 1px solid #b9bfd2;
+    border-radius: 0 0 4px 4px; cursor: pointer; }
+  #kb .bk { position: absolute; top: 0; height: 58%; background: #23273a; border: 1px solid #0d0f16;
+    border-radius: 0 0 3px 3px; cursor: pointer; z-index: 2; }
+  #kb .wk.down { background: color-mix(in srgb, var(--accent) 45%, #e9ecf5); }
+  #kb .bk.down { background: var(--accent); }
+  #kbHint { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 6px; }
+  #kbOct { font-size: 12.5px; color: var(--text); min-width: 74px; text-align: center;
+    border: 1px solid var(--border); border-radius: 7px; padding: 2px 8px; background: var(--panel2); }
+  #kb.recOn #btnKbRec { background: linear-gradient(135deg, #b33951, #ff6b7a); color: #fff;
+    border-color: #ff6b7a; }
+  #kbStrip { font-family: ui-monospace, "JetBrains Mono", Consolas, monospace; font-size: 11.5px;
+    color: var(--accent2); min-height: 18px; word-break: break-all; }
+  #kbWrap select, #kbWrap input[type=number] { width: auto; background: var(--panel2);
+    color: var(--text); border: 1px solid var(--border); border-radius: 8px;
+    padding: 4px 8px; font: inherit; font-size: 13px; outline: none; }
+  #kbWrap label.kbl { display: inline-flex; gap: 5px; align-items: center;
+    font-size: 12px; color: var(--muted); margin: 0; }
+  #kbStat { font-size: 12.5px; }
+  #kbStat .rec { color: var(--err); font-weight: 600; }
+
+  /* левая колонка: редактор + клавиатура одной карточкой колонки грида */
+  #leftCol { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+
+  html[data-theme="light"] { --bg: #eef0f5; --panel: #ffffff; --panel2: #e7e9f2;
+    --border: #c7ccdd; --text: #1c2030; --muted: #5a6180; }
+  html[data-theme="light"] header { background: rgba(238,240,245,.92); }
+</style>
+</head>
+<body>
+<header>
+  <a class="home iconbtn" href="/">← к генерации</a>
+  <h1>ABC-редактор</h1>
+  <span class="chip" id="chParse" hidden></span>
+  <span class="chip" id="chBpm" hidden></span>
+  <span class="chip" id="chSaved" hidden></span>
+  <div class="spacer"></div>
+  <a class="iconbtn" href="/studio" title="Студия: волна, правки звука, версии песни">студия →</a>
+  <span class="iconbtn" id="themeToggle" title="Светлая/тёмная тема">◐</span>
+</header>
+
+<main>
+  <div id="leftCol">
+  <section class="card">
+    <details class="panel" open>
+      <summary><div class="tlabel">ABC-текст</div></summary>
+      <textarea id="abcText" rows="22" spellcheck="false" class="mono" style="margin-top:8px"
+        placeholder="Вставьте ABC-нотацию — например из студии или шпаргалки ниже"></textarea>
+      <div class="hint" id="edStat"></div>
+      <div class="btnrow">
+        <div class="menu" id="exMenu">
+          <span class="iconbtn">◦ пример ▾</span>
+          <div class="drop">
+            <a data-ex="simple">мелодия с аккордами</a>
+            <a data-ex="voices">два голоса (дуэт)</a>
+            <a data-ex="yue">секции в стиле YuE</a>
+          </div>
+        </div>
+        <span class="iconbtn" id="btnCopy" title="Скопировать весь текст в буфер">⧉ копировать</span>
+        <a class="iconbtn" id="btnDl" download title="Скачать .abc">⤓ .abc</a>
+        <label class="iconbtn" style="margin:0" title="Открыть локальный .abc/.txt">↥ файл<input type="file" id="fileIn" accept=".abc,.txt,.abc.txt" hidden></label>
+        <span class="iconbtn" id="btnClear" title="Очистить редактор">✕</span>
+      </div>
+
+      <details class="panel" style="margin-top:12px">
+        <summary><div class="tlabel">Шпаргалка по нотации</div></summary>
+        <div class="hint" style="margin-top:8px; line-height:1.6">
+          Заголовок: <b>X:</b> номер · <b>T:</b> название · <b>M:</b> размер · <b>L:1/8</b> единица · <b>Q:1/4=90</b> темп · <b>K:</b> тональность.<br>
+          Ноты: C D E F G A B; <b>c d e</b> — октава выше; <b>C,...</b> — ниже. Диез/бемоль — <b>^</b>/<b>_</b>. Пауза — <b>z</b>.<br>
+          Цифра после ноты — длительность (C2 вдвое длиннее), такты — «|», повторы — <b>|:</b> <b>:|</b>.<br>
+          Аккорды — в кавычках перед нотой: <b>"Am"</b>. Лирика — строки <b>w:</b>.<br>
+          Голоса: <b>V:1 program=0 0</b> (фортепиано) … переключают партию; <b>%%MIDI program 40</b> — инструмент.<br>
+          Метка секции — строка <b>% chorus</b> (как в студии).<br>
+          <span id="instHint"></span>
+        </div>
+      </details>
+    </details>
+  </section>
+
+  <section class="card" id="kbWrap">
+    <details class="panel" id="kbPanel" open>
+      <summary><div class="tlabel">Миди-клавиатура — запись с компьютерной клавиатуры</div></summary>
+      <div id="kb">
+        <div class="btnrow" style="margin-top:10px">
+          <label class="kbl">Инструмент
+            <select id="kbInstr" title="Инструмент записи (GM-программа)"></select>
+          </label>
+          <label class="kbl">Размер
+            <select id="kbMeter" title="Тактовый размер для расстановки |">
+              <option value="4/4" selected>4/4</option>
+              <option value="3/4">3/4</option>
+              <option value="2/4">2/4</option>
+              <option value="6/8">6/8</option>
+            </select>
+          </label>
+          <label class="kbl">Сетка
+            <select id="kbGrid" title="Квантизация начала и длительности нот">
+              <option value="0.5">1/16</option>
+              <option value="1" selected>1/8</option>
+              <option value="2">1/4</option>
+              <option value="0">выкл</option>
+            </select>
+          </label>
+          <label class="kbl">Темп
+            <input type="number" id="kbBpm" min="30" max="300" step="1" value="100" style="width:64px" title="BPM — для метронома и заголовка Q:">
+          </label>
+          <span class="iconbtn" id="btnKbMetro" title="Метроном во время записи">⏲ метроном</span>
+        </div>
+
+        <div id="kbKeys" style="margin-top:10px"></div>
+        <div id="kbHint">
+          <span class="iconbtn" id="btnKbOctDn" title="Октаву ниже (Z)">−</span>
+          <span id="kbOct">C3–F4</span>
+          <span class="iconbtn" id="btnKbOctUp" title="Октаву выше (X)">＋</span>
+          <span class="hint" style="margin:0">A S D F G H J K L ; ' — белые · W E T Y U O P — чёрные · Z/X — октава</span>
+        </div>
+
+        <div class="btnrow" style="margin-top:10px">
+          <span class="iconbtn" id="btnKbRec" style="min-width:130px; text-align:center" title="Начать/остановить запись; пробел — стоп">⏺ запись</span>
+          <span class="iconbtn" id="btnKbUndo" hidden title="Вернуть текст, который был до вставки">↺ отменить вставку</span>
+          <span id="kbStat">Клавиши играют при открытой панели — жмите «запись» и набирайте мелодию</span>
+        </div>
+        <div id="kbStrip"></div>
+      </div>
+    </details>
+  </section>
+  </div>
+
+  <section class="card">
+    <div class="transport">
+      <span class="iconbtn" id="btnPlay" title="Играть / пауза (пробел)">▶</span>
+      <span class="iconbtn" id="btnStop" title="Остановить (Esc)">⏹</span>
+      <span class="iconbtn" id="btnLoop" title="Луп по кругу">⟲ луп</span>
+      <select id="tempoSel" title="Скорость воспроизведения">
+        <option value="0.5">×½</option>
+        <option value="0.75">×¾</option>
+        <option value="1" selected>×1</option>
+        <option value="1.25">×1¼</option>
+        <option value="1.5">×1½</option>
+        <option value="2">×2</option>
+      </select>
+      <span class="mono" id="tTime">0:00.0 / 0:00.0</span>
+      <div class="bar" id="pbar" title="Клик — переход"><i id="pfill"></i></div>
+    </div>
+
+    <div id="sheetBox">
+      <div id="sheet"></div>
+      <div id="sheetEmpty" hidden>Нот нет — вставьте ABC в редактор слева</div>
+      <div id="sheetErr" hidden></div>
+    </div>
+    <div class="hint">Клик по ноте или линейке — переход к такту. Пробел — играть/пауза, Esc — стоп. Играющая нота подсвечивается, за ней следует и курсор в тексте.</div>
+  </section>
+</main>
+
+<script src="/static/vendor/abcjs/abcjs-basic-min.js"></script>
+<script src="/static/abc.js?v=7"></script>
+</body>
+</html>
