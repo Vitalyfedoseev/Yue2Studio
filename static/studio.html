@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Студия · YuE2-3B</title>
+<style>
+  :root {
+    --bg: #0e1014; --panel: #161923; --panel2: #1c2030; --border: #272c3d;
+    --text: #e8eaf2; --muted: #8b91a8; --accent: #7c6cff; --accent2: #9d8bff;
+    --ok: #3ddc97; --err: #ff6b7a; --warn: #ffcc66;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 "Inter", "Segoe UI", system-ui, sans-serif; }
+  header {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    padding: 12px 20px; border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; background: rgba(14,16,20,.92); backdrop-filter: blur(6px); z-index: 5;
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 650; letter-spacing: .2px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 30vw; }
+  a.home { text-decoration: none; color: var(--muted); }
+  a.home:hover { color: var(--text); }
+  .chip { font-size: 12px; padding: 3px 10px; border-radius: 99px;
+    border: 1px solid var(--border); color: var(--muted); white-space: nowrap; }
+  .chip.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 35%, transparent); }
+  .spacer { flex: 1; }
+  .menu { position: relative; }
+  .menu .drop { position: absolute; right: 0; top: calc(100% + 6px); display: none;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 6px; min-width: 240px; z-index: 50; box-shadow: 0 6px 24px rgba(0,0,0,.45); }
+  .menu.open .drop { display: block; }
+  .menu .drop a { display: block; padding: 7px 10px; border-radius: 7px; cursor: pointer;
+    color: var(--text); text-decoration: none; font-size: 13px; }
+  .menu .drop a:hover { background: var(--panel2); }
+  .menu .drop a.dis { opacity: .4; pointer-events: none; }
+
+  main { display: grid; grid-template-columns: minmax(0, 1fr) 380px; gap: 16px;
+    padding: 16px 20px 40px; max-width: 1600px; margin: 0 auto; align-items: start; }
+  @media (max-width: 1100px) { main { grid-template-columns: 1fr; } }
+
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 14px 16px; min-width: 0; }
+  .card + .card { margin-top: 14px; }
+  .tlabel { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .6px; }
+  .hint { font-size: 12px; color: var(--muted); margin-top: 4px; }
+  .err { color: var(--err); }
+  .mono { font-family: ui-monospace, "JetBrains Mono", Consolas, monospace; }
+  textarea, input, select {
+    width: 100%; background: var(--panel2); color: var(--text);
+    border: 1px solid var(--border); border-radius: 9px; padding: 9px 11px;
+    font: inherit; outline: none;
+  }
+  textarea { resize: vertical; }
+  textarea:focus, input:focus, select:focus { border-color: var(--accent); }
+  textarea.mono { font-size: 12px; }
+  label { display: block; font-size: 12px; color: var(--muted); margin: 10px 0 4px; }
+  .row { display: flex; gap: 8px; align-items: center; }
+  .tags { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+  .tag { font-size: 12px; padding: 3px 9px; border-radius: 7px; cursor: pointer;
+    background: var(--panel2); border: 1px solid var(--border); color: var(--muted); }
+  .tag:hover { color: var(--text); border-color: var(--accent); }
+  .iconbtn { flex: none; cursor: pointer; color: var(--muted); padding: 5px 10px;
+    border-radius: 8px; border: 1px solid var(--border); background: var(--panel2);
+    font-size: 13px; user-select: none; text-decoration: none; display: inline-block; }
+  .iconbtn:hover { color: var(--text); border-color: var(--accent); }
+  .iconbtn.on { color: var(--accent2); border-color: var(--accent); }
+  .iconbtn:disabled, .iconbtn.off { opacity: .4; cursor: default; }
+  .btn {
+    width: 100%; margin-top: 12px; padding: 10px; border: none; border-radius: 10px;
+    background: linear-gradient(135deg, var(--accent), var(--accent2)); color: #fff;
+    font: 600 13px/1 inherit; cursor: pointer;
+  }
+  .btn:disabled { opacity: .45; cursor: default; }
+  .btn.ghost { background: var(--panel2); border: 1px solid var(--border); color: var(--text); }
+  .btn.ghost:hover { border-color: var(--accent); }
+  .btnrow { display: flex; gap: 8px; flex-wrap: wrap; }
+  .btnrow .btn { margin-top: 8px; flex: 1 1 40%; padding: 8px 6px; font-size: 12.5px; white-space: nowrap; }
+
+  /* таймлайн: линейка + дорожки */
+  #rulerRow { display: grid; grid-template-columns: 176px 1fr; gap: 8px; }
+  #ruler { width: 100%; height: 30px; display: block; border-radius: 7px;
+    background: var(--panel2); cursor: pointer; }
+  .laneTrack { display: grid; grid-template-columns: 176px 1fr; gap: 8px; margin-top: 8px; }
+  .laneHead { background: var(--panel2); border: 1px solid var(--border); border-radius: 8px;
+    padding: 6px 9px; font-size: 12px; display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+  .laneHead .lname { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .laneHead .lkind { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; }
+  .laneHead .lctl { display: flex; align-items: center; gap: 6px; color: var(--muted); }
+  .laneHead .lctl input[type=range] { width: 64px; padding: 0; accent-color: var(--accent); }
+  .laneHead .lctl input[type=checkbox] { width: auto; accent-color: var(--accent); }
+  .laneHead .lctl label { margin: 0; cursor: pointer; display: flex; gap: 3px; align-items: center; }
+  .laneHead .ldel { cursor: pointer; color: var(--muted); user-select: none; padding: 0 3px; }
+  .laneHead .ldel:hover { color: var(--err); }
+  .laneWave { width: 100%; height: 96px; display: block; border-radius: 8px;
+    background: var(--panel2); cursor: crosshair; }
+  .laneTrack.mainLane .laneWave { height: 170px; }
+  .laneTrack.mainLane .laneHead { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); }
+  .laneErr { color: var(--warn); font-size: 11px; }
+
+  .transport { display: flex; gap: 8px; align-items: center; margin-top: 10px; flex-wrap: wrap; }
+  #tTime { font-size: 12.5px; color: var(--muted); min-width: 100px; text-align: center; }
+
+  /* панели-аккордеоны */
+  details.panel > summary { cursor: pointer; list-style: none; }
+  details.panel > summary::-webkit-details-marker { display: none; }
+  details.panel > summary .tlabel { display: flex; align-items: center; gap: 6px; }
+  details.panel > summary .tlabel::before { content: '▸'; color: var(--accent2); transition: transform .15s; }
+  details.panel[open] > summary .tlabel::before { transform: rotate(90deg); }
+
+  .param { margin: 7px 0; }
+  .param label { margin: 0 0 2px; display: flex; justify-content: space-between; min-width: 0; }
+  .param input[type=range] { display: block; width: 100%; padding: 0; accent-color: var(--accent); }
+
+  /* набор изменений */
+  .pend { display: flex; gap: 8px; align-items: center; font-size: 13px; padding: 5px 9px;
+    background: var(--panel2); border: 1px solid var(--border); border-radius: 8px; margin-top: 6px; }
+  .pend .pnum { color: var(--accent2); font-weight: 600; flex: none; }
+  .pend .ptext { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .pend .pdel { flex: none; width: 18px; text-align: center; color: var(--muted); cursor: pointer;
+    border-radius: 5px; font-size: 12px; user-select: none; }
+  .pend .pdel:hover { color: var(--err); }
+
+  /* версии */
+  .vrow { display: flex; gap: 8px; align-items: center; padding: 7px 9px; border-radius: 9px;
+    border: 1px solid transparent; cursor: pointer; margin-top: 2px; }
+  .vrow:hover { background: var(--panel2); border-color: var(--border); }
+  .vrow.cur { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 10%, var(--panel2)); }
+  .vrow .vname { flex: 1; min-width: 0; font-weight: 600; font-size: 13px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .vrow .vname small { color: var(--muted); font-weight: 400; }
+  .vrow .vstar { flex: none; width: 20px; text-align: center; cursor: pointer; color: var(--muted); user-select: none; }
+  .vrow .vstar:hover { color: var(--text); }
+  .vrow .vstar.main { color: var(--warn); }
+  .vrow .vdur { color: var(--muted); font-size: 12px; white-space: nowrap; }
+  .vrow .vdel { flex: none; width: 18px; text-align: center; color: var(--muted); cursor: pointer;
+    border-radius: 5px; font-size: 12px; user-select: none; }
+  .vrow .vdel:hover { color: var(--err); }
+  .chip.mini { font-size: 10px; padding: 1px 7px; }
+
+  /* слои и компинг */
+  .lane-mix { display: flex; gap: 8px; align-items: center; padding: 6px 0;
+    border-bottom: 1px dashed color-mix(in srgb, var(--border) 55%, transparent); font-size: 13px; }
+  .lane-mix .lname { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .lane-mix input[type=range] { width: 90px; flex: none; padding: 0; accent-color: var(--accent); }
+  .lane-mix input[type=checkbox] { width: auto; flex: none; accent-color: var(--accent); }
+  .cpart { display: flex; gap: 8px; align-items: center; font-size: 13px; padding: 5px 9px;
+    background: var(--panel2); border: 1px solid var(--border); border-radius: 8px; margin-top: 6px; }
+  .cpart .ctext { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .cpart .cdel { flex: none; width: 18px; text-align: center; color: var(--muted); cursor: pointer; }
+  .cpart .cdel:hover { color: var(--err); }
+
+  /* светлую тему держим на CSS-переменных тёмной по умолчанию */
+  html[data-theme="light"] { --bg: #eef0f5; --panel: #ffffff; --panel2: #e7e9f2;
+    --border: #c7ccdd; --text: #1c2030; --muted: #5a6180; }
+  html[data-theme="light"] header { background: rgba(238,240,245,.92); }
+</style>
+</head>
+<body>
+<header>
+  <a class="home iconbtn" href="/">← к генерации</a>
+  <h1 id="tTitle">Студия</h1>
+  <span class="chip" id="chLabel" hidden></span>
+  <span class="chip" id="chDur" hidden></span>
+  <span class="chip" id="chSeed" hidden></span>
+  <span class="chip" id="chBpm" hidden></span>
+  <div class="spacer"></div>
+  <div class="menu" id="exportMenu">
+    <span class="iconbtn" id="exportBtn">⤓ экспорт</span>
+    <div class="drop">
+      <a id="exFlac">песня целиком — FLAC</a>
+      <a id="exMp3">песня целиком — MP3 320k</a>
+      <a id="exSelFlac" class="dis">выделение — FLAC</a>
+      <a id="exSelMp3" class="dis">выделение — MP3</a>
+      <a id="exMulti">мультитрек — zip (трек + слои)</a>
+    </div>
+  </div>
+  <span class="iconbtn" id="themeToggle" title="Светлая/тёмная тема">◐</span>
+</header>
+
+<main>
+  <div id="waveCol">
+    <div class="card">
+      <div id="rulerRow"><div></div><canvas id="ruler"></canvas></div>
+      <div id="laneStack"></div>
+      <div class="transport">
+        <span class="iconbtn" id="btnPlay" style="min-width:38px; text-align:center">▶</span>
+        <span class="mono" id="tTime">0:00.0 / 0:00.0</span>
+        <span class="iconbtn" id="btnLoop" title="Луп по выделению">⟲ луп</span>
+        <span class="iconbtn" id="btnSnap" title="Прилипание выделения к границам секций">◇ магнит</span>
+        <span class="iconbtn" id="btnZoomOut" title="Отдалить">−</span>
+        <span class="iconbtn" id="btnZoomIn" title="Приблизить">＋</span>
+        <span class="iconbtn" id="btnFit" title="Весь трек">⤢ весь</span>
+        <span class="iconbtn" id="btnSelAll" title="Выделить всё">▣</span>
+        <span class="iconbtn" id="btnClearSel" title="Снять выделение">⌫</span>
+        <span class="hint" id="selInfo" style="margin:0 0 0 auto">тяните мышью по волне — выделение диапазона</span>
+      </div>
+      <audio id="oneShot" preload="auto"></audio>
+      <div class="hint" id="waveHint" style="margin-top:6px">Клик — переход, протяжка — выделение, колесо — зум, Shift+тянуть — панорама. Пробел — играть/пауза.</div>
+    </div>
+
+    <div class="card">
+      <div class="tlabel">Версии песни</div>
+      <div id="verList"><div class="hint">…</div></div>
+    </div>
+  </div>
+
+  <div id="sideCol">
+    <details class="card panel" id="editPanel" open>
+      <summary><div class="tlabel">Правка</div></summary>
+      <div class="hint" style="margin:8px 0 0">Набирайте изменения — применятся все сразу, одной версией.</div>
+      <div id="pendingList"></div>
+      <button class="btn" id="btnCreateVer" disabled>создать версию</button>
+      <div class="row" style="margin-top:6px; gap:6px">
+        <span class="iconbtn" id="btnUndoSet" title="Снять последнее изменение (Ctrl+Z)">↶</span>
+        <span class="iconbtn" id="btnRedoSet" title="Вернуть снятое (Ctrl+Y)">↷</span>
+        <span class="iconbtn" id="btnListen" style="flex:1; text-align:center" title="Рендер набора во временный файл без создания версии">▶ прослушать набор</span>
+      </div>
+      <div class="hint" id="editStat"></div>
+
+      <label>Выделение</label>
+      <div class="btnrow">
+        <button class="btn ghost" id="btnCopy" disabled title="Запомнить выделение (Ctrl+C)">копировать</button>
+        <button class="btn ghost" id="btnPaste" disabled title="Вставить запомненное в позицию плеяхеда">вставить →</button>
+        <button class="btn ghost" id="btnDup" disabled title="Повторить выделение после него">дублировать</button>
+      </div>
+      <div class="btnrow">
+        <button class="btn ghost" id="btnKeep" disabled title="Набор: оставить только выделенный диапазон">＋ оставить</button>
+        <button class="btn ghost" id="btnCut" disabled title="Набор: вырезать выделенный диапазон (Del)">＋ вырезать</button>
+        <button class="btn ghost" id="btnSilence" disabled title="Набор: тишина на выделении">＋ тишина</button>
+      </div>
+      <div class="btnrow">
+        <button class="btn ghost" id="btnSwap" disabled title="Поменять местами два фрагмента">＋ поменять местами</button>
+        <button class="btn ghost" id="btnFadeReg" disabled title="Фейды на краях выделения">＋ фейды выделения</button>
+      </div>
+
+      <label>Фейды всего трека, с</label>
+      <div class="row">
+        <input type="number" id="fadeIn" min="0" max="30" step="0.1" value="1" title="fade-in">
+        <input type="number" id="fadeOut" min="0" max="30" step="0.1" value="2" title="fade-out">
+        <span class="iconbtn" id="btnFade" style="align-self:stretch; text-align:center">＋ добавить</span>
+      </div>
+      <label>Гейн, дБ <b id="gainVal" style="color:var(--text)">0</b> <span id="gainScope" class="hint" style="display:inline">(весь трек)</span></label>
+      <div class="row">
+        <input type="range" id="gainDb" min="-24" max="12" step="0.5" value="0" style="flex:1">
+        <span class="iconbtn" id="btnGain" style="text-align:center">＋ добавить</span>
+      </div>
+    </details>
+
+    <details class="card panel" id="fxPanel" open>
+      <summary><div class="tlabel">Эффекты</div></summary>
+      <label>Цепочка (ffmpeg)</label>
+      <select id="fxChain"></select>
+      <div id="fxParams"></div>
+      <label>Область</label>
+      <div class="row" style="gap:14px">
+        <label style="display:flex; gap:6px; align-items:center; margin:0; cursor:pointer">
+          <input type="radio" name="fxScope" value="all" checked style="width:auto"> весь трек
+        </label>
+        <label style="display:flex; gap:6px; align-items:center; margin:0; cursor:pointer">
+          <input type="radio" name="fxScope" value="sel" id="fxScopeSel" disabled style="width:auto"> выделение
+        </label>
+      </div>
+      <div class="btnrow">
+        <button class="btn ghost" id="btnFxPreview" title="Послушать фрагмент 20–35 с с эффектом">превью 15 с</button>
+        <button class="btn" id="btnFxApply" title="Добавить цепочку в набор изменений">＋ в набор изменений</button>
+      </div>
+      <div class="hint" id="fxStat"></div>
+    </details>
+
+    <details class="card panel" id="compPanel">
+      <summary><div class="tlabel">Компинг — склейка из версий</div></summary>
+      <div class="hint" style="margin:8px 0 0">Выделите фрагмент на волне и берите его в комп; переключайте версии внизу — из каждой можно взять свой кусок. Соберутся слева направо.</div>
+      <div class="btnrow">
+        <button class="btn ghost" id="btnCompAdd" disabled>＋ взять выделение из этой версии</button>
+      </div>
+      <div id="compList"></div>
+      <button class="btn" id="btnCompGo" disabled>собрать комп → версия</button>
+      <div class="hint" id="compStat"></div>
+    </details>
+
+    <details class="card panel" id="abcPanel">
+      <summary><div class="tlabel">ABC-партитура</div></summary>
+      <div class="hint" id="abcStat" style="margin:8px 0 4px"></div>
+      <textarea id="abcText" rows="12" spellcheck="false" class="mono"></textarea>
+      <div class="btnrow">
+        <button class="btn ghost" id="btnAbcSave">применить партитуру</button>
+        <button class="btn ghost" id="btnAbcReset" hidden title="Вернуть план модели, правка сотрётся">↺ план модели</button>
+      </div>
+      <div class="btnrow">
+        <button class="btn" id="btnRerender" title="Полный GPU-проход по этой партитуре с тем же сидом — новая версия">ре-рендер по ABC</button>
+      </div>
+      <div class="row" style="margin-top:6px">
+        <label style="display:flex; gap:6px; align-items:center; margin:0; cursor:pointer">
+          <input type="checkbox" id="rrDraft" style="width:auto"> черновик (~20 с)
+        </label>
+        <a class="iconbtn" id="abcDl" download style="margin-left:auto; text-decoration:none">⤓ .abc</a>
+      </div>
+      <div class="hint" id="rerenderStat"></div>
+    </details>
+
+    <details class="card panel" id="odPanel">
+      <summary><div class="tlabel">Овердаб, слои и микс</div></summary>
+      <div class="hint" style="margin:8px 0 0">Готовые партии — слои: гейн/мьют/соло слышны сразу при игре; «собрать микс» рендерит версию.</div>
+      <div id="laneList" style="margin-top:6px"></div>
+      <button class="btn ghost" id="btnMix" hidden>собрать микс → версия</button>
+      <div class="hint" id="mixStat"></div>
+      <div class="row" style="margin-top:8px">
+        <input type="file" id="odImport" accept=".mp3,.wav,.flac,.ogg,.oga,.m4a,.aac,.opus,.wma,.aiff,.aif" style="font-size:12px">
+      </div>
+      <div class="hint">Импорт своего аудио — добавится слоем этой песни (для микса).</div>
+      <label>Новая партия — стиль (жанр, инструмент)</label>
+      <textarea id="odStyle" rows="2" placeholder="акустическая гитара, слайд…"></textarea>
+      <div class="tags" id="odChips" style="margin-top:6px"></div>
+      <label style="display:flex; gap:6px; align-items:center; margin-top:10px; cursor:pointer">
+        <input type="checkbox" id="odInst" checked style="width:auto">
+        <span id="odInstLabel">без вокала (инструментал) — по умолчанию</span>
+      </label>
+      <label id="odLyricsLabel" hidden>Текст дублирующего вокала (пусто — как у трека)</label>
+      <textarea id="odLyrics" rows="2" disabled placeholder="снимите галочку «без вокала», чтобы задать текст"></textarea>
+      <div class="row" style="margin-top:6px">
+        <span class="iconbtn off" id="odLyricsFill" title="доступно только для вокальной партии">♪ текст этого трека</span>
+        <label style="margin:0; white-space:nowrap">гейн <b id="odGainVal">0.5</b></label>
+        <input type="range" id="odGain" min="0.1" max="1" step="0.05" value="0.5" style="flex:1">
+      </div>
+      <button class="btn" id="odGo">сгенерировать овердаб</button>
+      <div class="hint" id="odStat"></div>
+    </details>
+  </div>
+</main>
+
+<script src="/static/studio.js?v=4"></script>
+</body>
+</html>

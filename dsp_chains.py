@@ -1,9 +1,11 @@
-"""DSP-цепочки ffmpeg — порт internal/dsp/dsp.go из yue-studio.
+"""DSP-цепочки ffmpeg — порт internal/dsp/dsp.go из yue-studio + новые.
 
 «Стена» (wall): highpass → эксайтер → биткрашер → лимитер-стена + подмес
 белого шума 0.5–9 кГц; «Кассета» (tape): детюн-вибрато (wow) → срез верха
-+ розовый шип. Параметры клампятся в [min, max], отсутствующие берутся из
-дефолтов. Превью — фрагмент с 20-й секунды длиной 15 с.
++ розовый шип. «Перегруз» (overdrive): драйв → биткрашер → тон → лимитер;
+«Мастеринг» (master): HP → тепло/яркость EQ → компрессор → лимитер → ширина.
+Параметры клампятся в [min, max], отсутствующие берутся из дефолтов.
+Превью — фрагмент с 20-й секунды длиной 15 с.
 """
 import subprocess
 from dataclasses import dataclass
@@ -58,6 +60,30 @@ def _tape_graph(p):
     )
 
 
+def _overdrive_graph(p):
+    # отдельного фильтра overdrive в сборке нет: гнать уровень в acrusher
+    return (
+        "[0:a]highpass=f=40,"
+        f"volume={p['drive']:.1f}dB,"
+        f"acrusher=bits={p['crunch']:.0f}:mix=0.45,"
+        f"treble=g={p['tone']:.1f}:f=3000,"
+        f"volume={p['out']:.1f}dB,"
+        "alimiter=limit=0.95:attack=2:release=40:level=disabled[out]"
+    )
+
+
+def _master_graph(p):
+    # makeup у acompressor линейный 1–64: 1.3 ≈ +2 дБ
+    return (
+        "[0:a]highpass=f=28,"
+        f"bass=g={p['warm']:.1f}:f=110,"
+        f"treble=g={p['bright']:.1f}:f=4500,"
+        f"acompressor=threshold=-18dB:ratio={p['density']:.1f}:attack=12:release=140:makeup=1.3,"
+        f"alimiter=limit={p['ceil']:.2f}:attack=3:release=60:level=disabled,"
+        f"extrastereo=m={p['width']:.2f}[out]"
+    )
+
+
 _WALL_PARAMS = [
     Param("exciter", "эксайтер", 0.0, 6.0, 0.1, 2.5),
     Param("wall", "стена", 0.15, 0.9, 0.05, 0.5),
@@ -76,6 +102,19 @@ CHAINS = [
         Param("hiss", "шип", 0.0, 0.1, 0.002, 0.018),
         Param("cut", "срез, кГц", 5.0, 16.0, 0.5, 9.5),
     ], _tape_graph),
+    Chain("overdrive", "Перегруз", "драйв, хруст, тон — сатурация микса", [
+        Param("drive", "драйв, дБ", 0.0, 24.0, 0.5, 9.0),
+        Param("crunch", "хруст, бит", 4.0, 16.0, 1.0, 11.0),
+        Param("tone", "тон, дБ", -12.0, 12.0, 0.5, 2.0),
+        Param("out", "выход, дБ", -12.0, 6.0, 0.5, -1.0),
+    ], _overdrive_graph),
+    Chain("master", "Мастеринг", "компрессия + EQ + лимитер + ширина", [
+        Param("density", "плотность", 1.5, 8.0, 0.1, 3.0),
+        Param("warm", "тепло, дБ", -6.0, 6.0, 0.5, 1.5),
+        Param("bright", "яркость, дБ", -6.0, 6.0, 0.5, 1.5),
+        Param("width", "ширина", 0.0, 2.5, 0.05, 1.1),
+        Param("ceil", "потолок", 0.5, 1.0, 0.01, 0.95),
+    ], _master_graph),
 ]
 
 CHAINS_BY_ID = {c.id: c for c in CHAINS}

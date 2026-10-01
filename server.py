@@ -8,7 +8,13 @@ YuE2: AR–NAR Mixture-of-Transformers пишет ABC-нотный план + с
 токены, flow-matching даёт акустические латенты, VAE — 48 кГц стерео FLAC.
 Длина песни следует за лирикой (лимит 9000 токенов ≈ ~5 мин).
 Отмена генерации — родная (pipe.plan/generate_semantic принимают cancelled).
+
+Хранилище — SQLite (store.py): мета/партитуры/латенты/кеши в outputs/library.db,
+на диске только аудио. Студия-редактор: волна (peaks), правки (обрезка/фейды/
+гейн/цепочки), правка ABC, версии песни с флагом «основная», микшер овердаба.
 """
+import hashlib
+import io
 import json
 import os
 import queue
@@ -25,8 +31,9 @@ import numpy as np
 import torch
 
 import arc
+import store
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -79,7 +86,7 @@ MODEL_ID = os.environ.get("YUE2_MODEL", "m-a-p/YuE2-3B")
 VAE_ID = os.environ.get("YUE2_VAE", "m-a-p/YuE2-Vae")  # legacy — бенчмарки выше
 SAMPLE_RATE = 48000
 # Бюджет семантических токенов на песню (дефолт протокола 9000 ≈ 4.5–6 мин).
-# Контекст модели 24576 токенов общий; ~22k на песню ≈ 10–14 мин аудио,
+# Контекст модели 24576 общий; ~22k на песню ≈ 10–14 мин аудио,
 # пик VRAM при этом доходит до ~14 ГБ — система позволяет.
 MAX_SEM_TOKENS = int(os.environ.get("YUE2_MAX_TOKENS", "22000"))
 # Черновик: короткий рендер на прикидку (~15–20 с), как в yue-studio
@@ -148,6 +155,15 @@ LATENT_HZ = 25.0
 def _set(jid: str, **kw):
     with JOBS_LOCK:
         JOBS[jid].update(kw)
+        persist = {k: JOBS[jid].get(k)
+                   for k in ("status", "stage", "error") if JOBS[jid].get(k)}
+        res = JOBS[jid].get("result")
+        if res and res.get("file"):
+            persist["result_stem"] = res["file"][:-len(".flac")]
+    try:  # история джоб не должна ломать генерацию
+        store.job_update(jid, **persist)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _run_job(job: dict):
@@ -254,18 +270,18 @@ def _run_job(job: dict):
         import soundfile as sf
 
         title = job.get("title") or ""
-        stem = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{slugify(title) + '-' if slugify(title) else ''}{job['id'][:8]}"
+        stem = _alloc_result_stem(job, title)
         flac_path = OUT / f"{stem}.flac"
         sf.write(flac_path, audio, SAMPLE_RATE, subtype="PCM_24")
         # партитура и латенты — фундамент превью/овердаба/таймлайна;
         # float16 вдвое легче (~2 МБ/мин), decode вернём во float32
-        (OUT / f"{stem}.score.abc").write_text(plan.abc, encoding="utf-8")
         z = latents.detach().cpu().numpy() if hasattr(latents, "detach") else latents
-        np.save(OUT / f"{stem}.latent.npy", np.asarray(z, dtype=np.float16))
+        buf = io.BytesIO()
+        np.save(buf, np.asarray(z, dtype=np.float16))
 
-        meta = {
-            "file": flac_path.name,
-            "title": title,
+        now = datetime.now().isoformat(timespec="seconds")
+        row = {
+            "stem": stem, "file": flac_path.name, "title": title,
             "duration_s": round(len(audio) / SAMPLE_RATE, 2),
             "sample_rate": SAMPLE_RATE,
             "style": job["style"],          # склеенный промпт (как уходит в модель)
@@ -278,34 +294,52 @@ def _run_job(job: dict):
             "tokens": counters["tokens"],
             "total_s": round(time.time() - t0, 1),
             "peak_vram_gb": round(peak_vram, 2),
-            "ts": datetime.now().isoformat(timespec="seconds"),
-            "score_abc_file": f"{stem}.score.abc",
-            "latent_file": f"{stem}.latent.npy",
+            "ts": now, "created": now,
+            "score_abc": plan.abc,
+            "latent": buf.getvalue(),
             "arc": job.get("arc") or "",
-            "draft": bool(job.get("draft")),
+            "draft": 1 if job.get("draft") else 0,
+            "abc_text": (job.get("abc") or "").strip() or None,
+            "abc_source": "cover" if job.get("abc") else None,
         }
-        if job.get("abc"):
-            (OUT / f"{stem}.abc").write_text(job["abc"], encoding="utf-8")
-            meta["abc_file"] = f"{stem}.abc"   # сама партитура не в мете — бывает >100 КБ
-            meta["abc_chars"] = len(job["abc"])
+        if job.get("version_parent"):
+            prow = store.get_track(job["version_parent"])
+            if prow:  # родитель могли удалить, пока шла генерация
+                row["version_of"] = job["version_parent"]
+                row["version_root"] = prow.get("version_root") or prow["stem"]
+                row["version_label"] = job.get("version_label") or "рендер по ABC"
         if job.get("overdub_parent"):
             # овердаб: смешиваем с родителем сразу, ребёнок остаётся и отдельно
-            meta["overdub_of"] = job["overdub_parent"]
+            row["overdub_of"] = job["overdub_parent"]
             try:
                 mixed = _mix_overdub(
                     OUT / f"{job['overdub_parent']}.flac", flac_path,
                     job.get("overdub_gain", 0.5), job["overdub_parent"])
-                meta["overdub_file"] = mixed["file"]
+                row["overdub_file"] = mixed["file"]
             except Exception as e:  # noqa: BLE001 — неудачный микс не роняет джобу
-                meta["overdub_error"] = f"{type(e).__name__}: {e}"
-        (OUT / f"{stem}.json").write_text(
-            json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8"
-        )
-        _set(job["id"], status="done", stage="done", **{"result": meta})
+                row["overdub_error"] = f"{type(e).__name__}: {e}"
+        store.upsert_track(row)
+        _set(job["id"], status="done", stage="done",
+             result=store.track_to_api(store.get_track(stem)), result_stem=stem)
     except InterruptedError:
         _set(job["id"], status="canceled", error="остановлено пользователем")
     finally:
         stop_watch.set()
+
+
+def _alloc_result_stem(job: dict, title: str) -> str:
+    """Стем результата генерации: обычная — метка времени, ре-рендер версии —
+    <корень>.v<n> (нумерация при завершении, без коллизий)."""
+    if job.get("version_parent"):
+        prow = store.get_track(job["version_parent"])
+        if prow:
+            root = prow.get("version_root") or prow["stem"]
+            n = store.next_version_n(root)
+            while (OUT / f"{root}.v{n}.flac").exists():
+                n += 1
+            return f"{root}.v{n}"
+    return (f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-"
+            f"{slugify(title) + '-' if slugify(title) else ''}{job['id'][:8]}")
 
 
 def worker():
@@ -347,6 +381,16 @@ async def lifespan(_app):
         ENGINE.detail = "модель не грузится (YUE2_NO_MODEL=1)"
     else:
         ENGINE.start_load()
+    try:
+        n = store.migrate_legacy()
+        if n:
+            print(f"[store] импортировано legacy-записей: {n}")
+    except Exception as e:  # noqa: BLE001 — миграция не должна ронять сервер
+        print(f"[store] миграция не удалась: {type(e).__name__}: {e}")
+    try:
+        store.mark_interrupted()
+    except Exception:  # noqa: BLE001
+        pass
     threading.Thread(target=worker, daemon=True, name="job-worker").start()
     yield
 
@@ -610,6 +654,9 @@ def generate(req: GenRequest):
             "elapsed_s": 0.0, "tokens": 0, "tok_per_s": None, "pct": None,
             "cancel": False, "created": time.time(),
         }
+    store.job_create(jid, {"kind": "generate", "title": req.title.strip()[:80],
+                           "seed": req.seed, "cot": req.cot, "draft": req.draft,
+                           "abc_chars": len(abc) if abc else 0})
     QUEUE.put(jid)
     return {"id": jid}
 
@@ -685,6 +732,19 @@ def _clean_stem(stem: str) -> str:
     return stem[:-5] if stem.endswith(".flac") else stem
 
 
+def _abc_hash(text: str) -> str:
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
+
+
+def _need_track(stem: str) -> dict:
+    row = store.get_track(stem)
+    if row is None:
+        raise HTTPException(404, "запись не найдена")
+    if not (OUT / row["file"]).is_file():
+        raise HTTPException(404, "аудиофайл записи не найден")
+    return row
+
+
 def _rms_sections(flac: Path, bars: list) -> list:
     """Средняя RMS (дБ) по смежным группам тактов одной секции — карта
     громкости для ленты секций. soundfile+numpy, без librosa."""
@@ -719,23 +779,22 @@ def _rms_sections(flac: Path, bars: list) -> list:
 @app.get("/api/gallery/{stem}/score")
 def track_score(stem: str):
     """Таймлайн партитуры (abcparse): такты/голоса/секции/секунды + rms_sections.
-    Кеш — outputs/<stem>.d/score.json."""
+    Правленая партитура (abc_text) приоритетнее плана модели; кеш в БД
+    с хешем использованного ABC."""
     stem = _clean_stem(stem)
-    abc_path = OUT / f"{stem}.score.abc"
-    if not abc_path.is_file():
-        abc_path = OUT / f"{stem}.abc"      # кавер или старая запись без score
-    if not abc_path.is_file():
+    row = _need_track(stem)
+    abc_text = row.get("abc_text") or row.get("score_abc")
+    if not abc_text:
         raise HTTPException(404, "партитура не найдена (запись без нотного плана)")
-    d = OUT / f"{stem}.d"
-    d.mkdir(exist_ok=True)
-    cache = d / "score.json"
-    if cache.is_file():
-        return json.loads(cache.read_text(encoding="utf-8"))
+    h = _abc_hash(abc_text)
+    cached = store.get_score_cache(stem, h)
+    if cached:
+        return cached
     import abcparse
 
-    tl = abcparse.parse_abc(abc_path.read_text(encoding="utf-8"))
-    tl["rms_sections"] = _rms_sections(OUT / f"{stem}.flac", tl["bars"])
-    cache.write_text(json.dumps(tl, ensure_ascii=False), encoding="utf-8")
+    tl = abcparse.parse_abc(abc_text)
+    tl["rms_sections"] = _rms_sections(OUT / row["file"], tl["bars"])
+    store.put_score_cache(stem, h, tl)
     return tl
 
 
@@ -749,20 +808,14 @@ def track_preview(stem: str, req: PreviewRequest):
     """Превью фрагмента: срез латентов [from,to] сек → VAE-decode → flac
     в outputs/<stem>.d/. Клэмп по длительности звука (ABC бывает длиннее)."""
     stem = _clean_stem(stem)
-    latent = OUT / f"{stem}.latent.npy"
-    if not latent.is_file():
+    row = _need_track(stem)
+    blob = row.get("latent")
+    if not blob:
         raise HTTPException(404, "латенты не сохранены — запись сделана до появления превью")
     if ENGINE.error or ENGINE.pipe is None:
         raise HTTPException(503, f"модель не готова: {ENGINE.error or ENGINE.detail}")
-    meta_path = OUT / f"{stem}.json"
-    duration = None
-    if meta_path.is_file():
-        try:
-            duration = json.loads(meta_path.read_text(encoding="utf-8")).get("duration_s")
-        except ValueError:
-            pass
-    z = np.load(latent)
-    total = duration if duration else len(z) / LATENT_HZ
+    z = np.load(io.BytesIO(blob))
+    total = row.get("duration_s") or len(z) / LATENT_HZ
     f = max(0.0, min(req.from_sec, total - 1))
     t = min(max(req.to_sec, f + 1), total)
     if t - f < 1:
@@ -793,25 +846,22 @@ def track_preview(stem: str, req: PreviewRequest):
 @app.post("/api/gallery/{stem}/analyze")
 def track_analyze(stem: str, fresh: bool = False):
     """librosa-метрики записи (темп, тональность, динамика, полосы, стерео);
-    кеш — outputs/<stem>.d/metrics.json, ?fresh=true пересчитать."""
+    кеш в БД, ?fresh=true пересчитать."""
     stem = _clean_stem(stem)
-    flac = OUT / f"{stem}.flac"
-    if not flac.is_file():
-        raise HTTPException(404, "запись не найдена")
-    d = OUT / f"{stem}.d"
-    cache = d / "metrics.json"
-    if cache.is_file() and not fresh:
-        return json.loads(cache.read_text(encoding="utf-8"))
+    row = _need_track(stem)
+    if not fresh:
+        cached = store.get_metrics(stem)
+        if cached:
+            return cached
     try:
         import audio_metrics
     except ImportError:
         raise HTTPException(503, "librosa не установлена — метрики недоступны")
     try:
-        m = audio_metrics.analyze_file(flac)
+        m = audio_metrics.analyze_file(OUT / row["file"])
     except Exception as e:  # noqa: BLE001
         raise HTTPException(500, f"анализ не удался: {type(e).__name__}: {e}")
-    d.mkdir(exist_ok=True)
-    cache.write_text(json.dumps(m, ensure_ascii=False, indent=1), encoding="utf-8")
+    store.put_metrics(stem, m)
     return m
 
 
@@ -834,57 +884,949 @@ def dsp_chains_meta():
 
 @app.get("/api/gallery/{stem}/dsp")
 def dsp_variants(stem: str):
-    """Список DSP-вариантов записи (с метриками, если считались)."""
+    """Legacy: DSP-варианты старого формата в <stem>.d/ (новые создают версии)."""
     stem = _clean_stem(stem)
     d = OUT / f"{stem}.d"
     variants = []
     if d.is_dir():
         for p in sorted(d.glob("dsp-*.flac")):
             item = {"file": f"{stem}.d/{p.name}", "url": f"/outputs/{stem}.d/{p.name}"}
-            m = p.with_name(p.name + ".metrics.json")
-            if m.is_file():
-                try:
-                    item["metrics"] = json.loads(m.read_text(encoding="utf-8"))
-                except ValueError:
-                    pass
             variants.append(item)
     return {"variants": variants}
 
 
 @app.post("/api/gallery/{stem}/dsp")
 def dsp_apply(stem: str, req: DspRequest):
-    """Прогнать цепочку (wall/wall-lite/tape) по FLAC записи; результат —
-    outputs/<stem>.d/dsp[-preview]-<chain>.flac + метрики варианта."""
+    """preview=True — фрагмент с 20-й секунды (временный аудиофайл в <stem>.d/);
+    иначе цепочка создаёт полноценную версию трека (в «Версиях песни»)."""
     stem = _clean_stem(stem)
-    flac = OUT / f"{stem}.flac"
-    if not flac.is_file():
-        raise HTTPException(404, "запись не найдена")
+    row = _need_track(stem)
+    flac = OUT / row["file"]
     import dsp_chains
 
-    name = f"dsp-preview-{req.chain}.flac" if req.preview else f"dsp-{req.chain}.flac"
     d = OUT / f"{stem}.d"
     d.mkdir(exist_ok=True)
-    dst = d / name
     try:
-        merged = dsp_chains.run_chain(
-            flac, dst, req.chain, req.params,
-            span=(dsp_chains.PREVIEW_START, dsp_chains.PREVIEW_DUR) if req.preview else None,
-        )
+        if req.preview:
+            name = f"dsp-preview-{req.chain}.flac"
+            dst = d / name
+            merged = dsp_chains.run_chain(
+                flac, dst, req.chain, req.params,
+                span=(dsp_chains.PREVIEW_START, dsp_chains.PREVIEW_DUR))
+            return {"file": f"{stem}.d/{name}", "url": f"/outputs/{stem}.d/{name}",
+                    "params": merged, "metrics": None}
+        tmp = d / f"dsp-{uuid.uuid4().hex[:8]}.flac"
+        merged = dsp_chains.run_chain(flac, tmp, req.chain, req.params)
     except KeyError as e:
         raise HTTPException(422, str(e))
     except RuntimeError as e:
         raise HTTPException(500, f"ffmpeg: {e}")
-    metrics = None
+    chain = dsp_chains.CHAINS_BY_ID[req.chain]
+    ver = _create_version(stem, tmp, chain.name.lower())
+    return {"stem": ver["stem"], "file": ver["file"], "url": ver["audio_url"],
+            "label": ver.get("version_label"), "params": merged}
+
+
+# ---------- версии песни ----------
+
+def _root_of(row: dict) -> str:
+    return row.get("version_root") or row["stem"]
+
+
+def _create_version(src_stem: str, new_flac: Path, label: str,
+                    latent_bytes: bytes | None = None,
+                    timeline: "_Timeline | None" = None) -> dict:
+    """Новая версия песни: flac переименовывается из tmp, строка в БД
+    копируется с родителя; латенты (опц. трансформированные) и таймлайн
+    адаптируются под трансформации времени."""
+    import soundfile as sf
+
+    src = _need_track(src_stem)
+    prow = store.get_track(src_stem)
+    root = _root_of(prow)
+    # накопительная метка цепочки правок: «кассета» → «кассета + перегруз»
+    plabel = src.get("version_label")
+    if plabel:
+        label = f"{plabel} + {label}"
+    n = store.next_version_n(root)
+    while (OUT / f"{root}.v{n}.flac").exists():
+        n += 1
+    stem = f"{root}.v{n}"
+    dst = OUT / f"{stem}.flac"
+    new_flac.rename(dst)
+    info = sf.info(str(dst))
+    now = datetime.now().isoformat(timespec="seconds")
+    row = {
+        "stem": stem, "file": dst.name,
+        "title": src.get("title") or "",
+        "duration_s": round(info.frames / info.samplerate, 2),
+        "sample_rate": info.samplerate,
+        "style": src.get("style") or "", "style_base": src.get("style_base") or "",
+        "voice": src.get("voice") or "", "lyrics": src.get("lyrics") or "",
+        "cot": src.get("cot") or "full", "cfg_scale": src.get("cfg_scale"),
+        "seed": src.get("seed"), "arc": src.get("arc") or "",
+        "draft": 1 if src.get("draft") else 0,
+        "ts": now, "created": now,
+        "abc_text": src.get("abc_text"), "abc_source": src.get("abc_source"),
+        "score_abc": src.get("score_abc"),
+        "latent": latent_bytes if latent_bytes is not None else src.get("latent"),
+        "version_of": src_stem, "version_root": root, "version_n": n,
+        "version_label": label, "group_main": 0,
+    }
+    store.upsert_track(row)
     try:
         import audio_metrics
 
-        metrics = audio_metrics.analyze_file(dst)
-        (d / f"{name}.metrics.json").write_text(
-            json.dumps(metrics, ensure_ascii=False, indent=1), encoding="utf-8")
-    except Exception:  # noqa: BLE001 — вариант валиден и без метрик
+        store.put_metrics(stem, audio_metrics.analyze_file(dst))
+    except Exception:  # noqa: BLE001 — версия валидна и без метрик
         pass
-    return {"file": f"{stem}.d/{name}", "url": f"/outputs/{stem}.d/{name}",
-            "params": merged, "metrics": metrics}
+    try:
+        _adapt_score(src, stem, dst, timeline or _Timeline())
+    except Exception:  # noqa: BLE001
+        pass
+    return store.track_to_api(store.get_track(stem))
+
+
+class _Timeline:
+    """Композиция трансформаций времени «запись → рабочий файл»: вырезы,
+    вставки, дубли, обмены. Каждый op добавляет шаг; регионы последующих
+    операций и таймлайн партитуры финальной версии прогоняются через fold."""
+    def __init__(self):
+        self.steps: list = []
+
+    def map(self, t: float) -> float:
+        for s in self.steps:
+            t = s(t)
+        return max(0.0, t)
+
+    def add(self, step):
+        self.steps.append(step)
+
+
+def _adapt_score(src_row: dict, new_stem: str, new_flac: Path, timeline: "_Timeline"):
+    """Таймлайн версии: партитура та же, такты прогоняются через трансформации
+    времени (вырезы/вставки), rms пересчитывается по новому flac."""
+    abc_text = src_row.get("abc_text") or src_row.get("score_abc")
+    if not abc_text:
+        return
+    import abcparse
+
+    tl = abcparse.parse_abc(abc_text)
+    if timeline.steps:
+        bars = []
+        for b in tl["bars"]:
+            s = timeline.map(b["start_sec"])
+            e = timeline.map(b["end_sec"])
+            if e - s >= 0.05:
+                bars.append({**b, "start_sec": round(s, 2), "end_sec": round(e, 2)})
+        tl["bars"] = bars
+        tl["duration_sec"] = round(bars[-1]["end_sec"], 2) if bars else 0.0
+    tl["rms_sections"] = _rms_sections(new_flac, tl["bars"])
+    store.put_score_cache(new_stem, _abc_hash(abc_text), tl)
+
+
+def _lat_slice_frames(lat: np.ndarray | None, wa: float, wb: float) -> np.ndarray | None:
+    """Срез латента в рабочих секундах [wa, wb]."""
+    if lat is None:
+        return None
+    a = max(0, min(int(wa * LATENT_HZ), len(lat)))
+    b = max(a, min(int(wb * LATENT_HZ), len(lat)))
+    return lat[a:b].copy()
+
+
+class Region(BaseModel):
+    from_sec: float = Field(..., ge=0)
+    to_sec: float = Field(..., gt=0)
+
+
+class EditOp(BaseModel):
+    op: str = Field(..., pattern="^(trim-keep|trim-cut|fade|fade-region|gain|chain|"
+                                "silence|duplicate|insert-from|swap)$")
+    params: dict = Field(default_factory=dict)
+    region: Optional[Region] = None
+    region2: Optional[Region] = None   # второй фрагмент для swap
+
+
+class EditRequest(BaseModel):
+    """Набор изменений одной кнопкой: ops применяются по порядку, результат —
+    ОДНА версия (preview=true — временный файл без версии). Регионы задаются
+    в координатах записи и после вырезов/вставок пересчитываются автоматически."""
+    ops: list[EditOp] = Field(default_factory=list, max_length=16)
+    op: Optional[str] = None
+    params: dict = Field(default_factory=dict)
+    region: Optional[Region] = None
+    label: str = Field("", max_length=120)
+    preview: bool = Field(False, description="Рендер во временный файл, без версии")
+
+
+def _clampf(v, lo: float, hi: float, dflt: float) -> float:
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return dflt
+    return min(hi, max(lo, v))
+
+
+def _microfade(seg: np.ndarray, sr: int, ms: int = 10):
+    n = min(len(seg), int(sr * ms / 1000))
+    if n:
+        ramp = np.linspace(0.0, 1.0, n)[:, None]
+        seg[:n] *= ramp
+        seg[-n:] *= ramp[::-1]
+
+
+def _frames(lat: np.ndarray | None, t_w: float) -> int:
+    if lat is None:
+        return 0
+    return max(0, min(int(round(t_w * LATENT_HZ)), len(lat)))
+
+
+@app.post("/api/gallery/{stem}/edit")
+def track_edit(stem: str, req: EditRequest):
+    """Набор правок одним синхронным рендером: обрезка, фейды, гейн, цепочки,
+    тишина, дубли, вставки, обмены. Результат — одна версия (или preview).
+    Латенты трансформируются зеркально аудио, партитура — через fold времени."""
+    stem = _clean_stem(stem)
+    row = _need_track(stem)
+    flac = OUT / row["file"]
+    dur = row.get("duration_s") or 0.0
+    ops = list(req.ops)
+    if not ops and req.op:
+        ops = [EditOp(op=req.op, params=req.params, region=req.region)]
+    if not ops:
+        raise HTTPException(422, "пустой набор изменений")
+    import soundfile as sf
+
+    d = OUT / f"{stem}.d"
+    d.mkdir(exist_ok=True)
+
+    labels: list[str] = []
+    merged = None
+    tl = _Timeline()                      # время записи → рабочий файл
+    lat = None
+    if row.get("latent"):
+        try:
+            lat = np.load(io.BytesIO(row["latent"])).copy()
+        except Exception:  # noqa: BLE001 — правки аудио работают и без латентов
+            lat = None
+
+    def lat_bytes() -> bytes | None:
+        if lat is None:
+            return None
+        buf = io.BytesIO()
+        np.save(buf, np.asarray(lat, dtype=np.float16))
+        return buf.getvalue()
+
+    temps: list[Path] = []
+    cur = flac
+    data = None
+    sr = None
+
+    def _freeze() -> "callable":
+        """Снимок текущего fold'а: шаги обязаны ссылаться на состояние ДО себя
+        (иначе tl.map внутри шага — бесконечная рекурсия)."""
+        steps = list(tl.steps)
+
+        def f(t: float) -> float:
+            for s in steps:
+                t = s(t)
+            return max(0.0, t)
+        return f
+
+    for eo in ops:
+        nxt = d / f"edit-{uuid.uuid4().hex[:8]}.flac"
+        temps.append(nxt)
+        prev = _freeze()
+        p = eo.params
+        reg = None
+        if eo.region:
+            a = max(0.0, min(eo.region.from_sec, dur - 0.1))
+            b = min(max(eo.region.to_sec, a + 0.1), dur)
+            reg = (a, b)
+
+        if eo.op in ("trim-keep", "trim-cut", "silence", "duplicate",
+                     "fade-region", "gain", "fade"):
+            data, sr = sf.read(str(cur), dtype="float32", always_2d=True)
+
+        if eo.op in ("trim-keep", "trim-cut"):
+            if reg is None:
+                raise HTTPException(422, f"«{eo.op}»: нужен выделенный диапазон")
+            wa, wb = prev(reg[0]), prev(reg[1])
+            a_i = max(0, min(int(wa * sr), len(data) - 1))
+            b_i = max(a_i + 1, min(int(wb * sr), len(data)))
+            if eo.op == "trim-keep":
+                out = data[a_i:b_i].copy()
+                _microfade(out, sr)
+                lat = _lat_slice_frames(lat, wa, wb)
+                fa = wa
+                tl.add(lambda t, pr=prev, fa=fa, a=a, b=b: pr(min(max(t, a), b)) - fa)
+                labels.append(f"фрагмент {reg[0]:.0f}–{reg[1]:.0f} с")
+            else:
+                # кроссфейд 10 мс на стыке склейки — без щелчка
+                xf = min(int(0.01 * sr), a_i, len(data) - b_i)
+                if xf > 0:
+                    wgt = np.linspace(0.0, 1.0, xf)[:, None]
+                    joint = data[a_i - xf:a_i] * (1 - wgt) + data[b_i:b_i + xf] * wgt
+                    out = np.concatenate([data[:a_i - xf], joint, data[b_i + xf:]])
+                else:
+                    out = np.concatenate([data[:a_i], data[b_i:]])
+                la, lb = _frames(lat, wa), _frames(lat, wb)
+                if lat is not None:
+                    lat = np.concatenate([lat[:la], lat[lb:]])
+                fa, fb = wa, wb
+                tl.add(lambda t, pr=prev, fa=fa, fb=fb, a=a, b=b:
+                       pr(t) if t < a else (fa if t < b else pr(t) - (fb - fa)))
+                labels.append(f"вырезка {reg[0]:.0f}–{reg[1]:.1f} с")
+            sf.write(str(nxt), out, sr, subtype="PCM_24")
+        elif eo.op == "silence":
+            if reg is None:
+                raise HTTPException(422, "«тишина»: нужен выделенный диапазон")
+            wa, wb = prev(reg[0]), prev(reg[1])
+            a_i = max(0, min(int(wa * sr), len(data)))
+            b_i = max(a_i, min(int(wb * sr), len(data)))
+            data[a_i:b_i] = 0.0
+            xr = min(int(0.005 * sr), a_i, len(data) - b_i)
+            if xr > 0:
+                data[a_i - xr:a_i] *= np.linspace(1.0, 0.0, xr)[:, None]
+                data[b_i:b_i + xr] *= np.linspace(0.0, 1.0, xr)[:, None]
+            sf.write(str(nxt), data, sr, subtype="PCM_24")
+            labels.append(f"тишина {reg[0]:.0f}–{reg[1]:.0f} с")
+        elif eo.op == "duplicate":
+            if reg is None:
+                raise HTTPException(422, "«дубликат»: нужен выделенный диапазон")
+            n_times = max(1, min(8, int(_clampf(p.get("times"), 1, 8, 1))))
+            wa, wb = prev(reg[0]), prev(reg[1])
+            a_i = max(0, min(int(wa * sr), len(data) - 1))
+            b_i = max(a_i + 1, min(int(wb * sr), len(data)))
+            seg = data[a_i:b_i]
+            out = np.concatenate([data[:b_i], np.tile(seg, (n_times, 1)), data[b_i:]])
+            la, lb = _frames(lat, wa), _frames(lat, wb)
+            if lat is not None and lb > la:
+                lseg = lat[la:lb]
+                lat = np.concatenate([lat[:lb], np.tile(lseg, (n_times, 1)), lat[lb:]])
+            fb = wb
+            add_len = (wb - wa) * n_times
+            tl.add(lambda t, pr=prev, fb=fb, add_len=add_len, b=b:
+                   pr(t) if t <= b else pr(t) + add_len)
+            sf.write(str(nxt), out, sr, subtype="PCM_24")
+            labels.append(f"дубликат {reg[0]:.0f}–{reg[1]:.0f} с ×{n_times}")
+        elif eo.op == "insert-from":
+            try:
+                s1 = max(0.0, _clampf(p.get("src_from"), 0, dur, 0.0))
+                s2 = min(dur, max(s1 + 0.1, _clampf(p.get("src_to"), 0, dur, s1 + 1.0)))
+                at = max(0.0, min(_clampf(p.get("at"), 0, dur, 0.0), dur))
+            except HTTPException:
+                raise
+            except Exception:
+                raise HTTPException(422, "«вставка»: нужны src_from/src_to/at")
+            data, sr = sf.read(str(cur), dtype="float32", always_2d=True)
+            ws1, ws2, wat = prev(s1), prev(s2), prev(at)
+            i1 = max(0, min(int(ws1 * sr), len(data) - 1))
+            i2 = max(i1 + 1, min(int(ws2 * sr), len(data)))
+            j = max(0, min(int(wat * sr), len(data)))
+            seg = data[i1:i2]
+            out = np.concatenate([data[:j], seg, data[j:]])
+            f1, f2, fj = _frames(lat, ws1), _frames(lat, ws2), _frames(lat, wat)
+            if lat is not None and f2 > f1:
+                lat = np.concatenate([lat[:fj], lat[f1:f2], lat[fj:]])
+            ins_len = ws2 - ws1
+            tl.add(lambda t, pr=prev, at=at, ins_len=ins_len:
+                   pr(t) if t <= at else pr(t) + ins_len)
+            sf.write(str(nxt), out, sr, subtype="PCM_24")
+            if abs(s1 - at) < 0.05 and abs(s2 - s1) > 0:
+                labels.append(f"дубликат {s1:.0f}–{s2:.0f} с")
+            else:
+                labels.append(f"вставка {s1:.0f}–{s2:.0f} с → {at:.0f} с")
+        elif eo.op == "swap":
+            r1, r2 = eo.region, eo.region2
+            if not r1 or not r2:
+                raise HTTPException(422, "«поменять местами»: нужны два фрагмента")
+            a1 = max(0.0, min(r1.from_sec, r2.from_sec, dur - 0.2))
+            b1 = min(max(r1.to_sec if r1.from_sec <= r2.from_sec else r2.to_sec,
+                         a1 + 0.1), dur)
+            a2 = max(b1, min(max(r1.from_sec, r2.from_sec), dur - 0.1))
+            b2 = min(max(r1.to_sec if r1.from_sec > r2.from_sec else r2.to_sec,
+                         a2 + 0.1), dur)
+            data, sr = sf.read(str(cur), dtype="float32", always_2d=True)
+            m1a, m1b, m2a, m2b = prev(a1), prev(b1), prev(a2), prev(b2)
+            i1a, i1b = int(m1a * sr), int(m1b * sr)
+            i2a, i2b = int(m2a * sr), int(m2b * sr)
+            i1b = max(i1a + 1, min(i1b, len(data)))
+            i2b = max(i2a + 1, min(i2b, len(data)))
+            A, B = data[i1a:i1b].copy(), data[i2a:i2b].copy()
+            out = np.concatenate([data[:i1a], B, data[i1b:i2a], A, data[i2b:]])
+            if lat is not None:
+                la1, lb1 = _frames(lat, m1a), _frames(lat, m1b)
+                la2, lb2 = _frames(lat, m2a), _frames(lat, m2b)
+                LA, LB = lat[la1:lb1].copy(), lat[la2:lb2].copy()
+                lat = np.concatenate([lat[:la1], LB, lat[lb1:la2], LA, lat[lb2:]])
+            tl.add(lambda t, pr=prev, a1=a1, b1=b1, a2=a2,
+                   f1a=m1a, f1b=m1b, f2a=m2a, f2b=m2b: (
+                       pr(t) if t < a1 else
+                       (f2b - f1b + pr(t)) if t < b1 else
+                       (f1a + (f2b - f2a) + (pr(t) - f1b)) if t < a2 else
+                       (f1a + (pr(t) - f2a)) if t < b2 else pr(t)))
+            sf.write(str(nxt), out, sr, subtype="PCM_24")
+            labels.append(f"поменять {a1:.0f}–{b1:.0f} ↔ {a2:.0f}–{b2:.0f} с")
+        elif eo.op == "fade":
+            fi = _clampf(p.get("fade_in"), 0, 30, 1.0)
+            fo = _clampf(p.get("fade_out"), 0, 30, 2.0)
+            out = data.copy()
+            ni, no = int(fi * sr), int(fo * sr)
+            if ni > 0:
+                out[:ni] *= np.linspace(0.0, 1.0, ni)[:, None]
+            if no > 0:
+                out[-no:] *= np.linspace(1.0, 0.0, no)[:, None]
+            sf.write(str(nxt), out, sr, subtype="PCM_24")
+            labels.append("фейды")
+        elif eo.op == "fade-region":
+            if reg is None:
+                raise HTTPException(422, "«фейды на выделении»: нужен диапазон")
+            fi = _clampf(p.get("fade_in"), 0, 30, 0.5)
+            fo = _clampf(p.get("fade_out"), 0, 30, 0.5)
+            wa, wb = prev(reg[0]), prev(reg[1])
+            a_i = max(0, min(int(wa * sr), len(data)))
+            b_i = max(a_i, min(int(wb * sr), len(data)))
+            ni = min(int(fi * sr), (b_i - a_i) // 2 or 1)
+            no = min(int(fo * sr), (b_i - a_i) // 2 or 1)
+            if ni > 0:
+                data[a_i:a_i + ni] *= np.linspace(0.0, 1.0, ni)[:, None]
+            if no > 0:
+                data[b_i - no:b_i] *= np.linspace(1.0, 0.0, no)[:, None]
+            sf.write(str(nxt), data, sr, subtype="PCM_24")
+            labels.append(f"фейды на {reg[0]:.0f}–{reg[1]:.0f} с")
+        elif eo.op == "gain":
+            db = _clampf(p.get("db"), -24, 24, 0.0)
+            g = 10 ** (db / 20)
+            out = data.copy()
+            if reg is None:
+                out *= g
+                labels.append(f"гейн {db:+.1f} дБ")
+            else:
+                # плавный контур гейна на краях региона — без щелчков на стыках
+                env = np.full(len(out), 1.0)
+                a_i = max(0, min(int(prev(reg[0]) * sr), len(out) - 1))
+                b_i = max(a_i + 1, min(int(prev(reg[1]) * sr), len(out)))
+                xf = min(int(0.01 * sr), (b_i - a_i) // 2 or 1)
+                env[a_i:b_i] = g
+                env[a_i:a_i + xf] = np.linspace(1.0, g, xf)
+                env[b_i - xf:b_i] = np.linspace(g, 1.0, xf)
+                out *= env[:, None]
+                labels.append(f"гейн {db:+.1f} дБ ({reg[0]:.0f}–{reg[1]:.0f} с)")
+            sf.write(str(nxt), out, sr, subtype="PCM_24")
+        elif eo.op == "chain":
+            import dsp_chains
+
+            chain_id = str(p.get("chain") or "tape")
+            if chain_id not in dsp_chains.CHAINS_BY_ID:
+                raise HTTPException(422, f"неизвестная цепочка: {chain_id}")
+            cparams = {k: v for k, v in p.items() if k != "chain"}
+            try:
+                if reg is None:
+                    merged = dsp_chains.run_chain(cur, nxt, chain_id, cparams)
+                else:
+                    a_w = max(0.0, prev(reg[0]))
+                    b_w = prev(reg[1])
+                    frag = d / f"edit-frag-{uuid.uuid4().hex[:8]}.flac"
+                    merged = dsp_chains.run_chain(cur, frag, chain_id, cparams,
+                                                  span=(a_w, b_w - a_w))
+                    base, csr = sf.read(str(cur), dtype="float32", always_2d=True)
+                    proc, psr = sf.read(str(frag), dtype="float32", always_2d=True)
+                    if psr != csr:
+                        raise RuntimeError("частота обработанного фрагмента не совпала")
+                    sr = csr
+                    a_i = max(0, min(int(a_w * sr), len(base) - 1))
+                    b_i = max(a_i + 1, min(int(b_w * sr), len(base)))
+                    n = min(len(proc), b_i - a_i)
+                    xf = min(int(0.01 * sr), n // 2 or 1)
+                    wgt = np.ones(n)
+                    wgt[:xf] = np.linspace(0.0, 1.0, xf)
+                    wgt[n - xf:] = np.linspace(1.0, 0.0, xf)
+                    base[a_i:a_i + n] = proc[:n] * wgt[:, None] + base[a_i:a_i + n] * (1 - wgt[:, None])
+                    sf.write(str(nxt), base, sr, subtype="PCM_24")
+                    frag.unlink(missing_ok=True)
+            except KeyError as e:
+                raise HTTPException(422, str(e))
+            except RuntimeError as e:
+                raise HTTPException(500, f"ffmpeg: {e}")
+            name = dsp_chains.CHAINS_BY_ID[chain_id].name.lower()
+            labels.append(name if reg is None else f"{name} ({reg[0]:.0f}–{reg[1]:.0f} с)")
+        cur = nxt
+
+    if req.preview:
+        # «прослушать, что получится» — без создания версии
+        for t in temps[:-1]:
+            t.unlink(missing_ok=True)
+        prev = d / "edit-preview.flac"
+        cur.rename(prev)
+        info = sf.info(str(prev))
+        return {"preview": True, "url": f"/outputs/{stem}.d/{prev.name}",
+                "duration_s": round(info.frames / info.samplerate, 2),
+                "label": (req.label.strip() or " + ".join(labels))[:120]}
+
+    for t in temps[:-1]:
+        t.unlink(missing_ok=True)
+    label = req.label.strip() or " + ".join(labels)
+    ver = _create_version(stem, cur, label[:120], latent_bytes=lat_bytes(), timeline=tl)
+    return {"stem": ver["stem"], "file": ver["file"], "url": ver["audio_url"],
+            "label": ver.get("version_label"), "version_n": ver.get("version_n"),
+            "params": merged}
+
+
+@app.get("/api/gallery/{stem}/peaks")
+def track_peaks(stem: str, n: int = 2400,
+                from_sec: float = 0.0, to_sec: Optional[float] = None):
+    """Пики волны: min/max/rms по n бакетам (для канваса студии).
+    Полный трек кешируется в БД по n; зум-окна считаются на лету."""
+    stem = _clean_stem(stem)
+    row = _need_track(stem)
+    n = min(8000, max(32, int(n)))
+    full = from_sec <= 0 and to_sec is None
+    if full:
+        cached = store.get_peaks(stem, n)
+        if cached:
+            return cached
+    import soundfile as sf
+
+    flac = OUT / row["file"]
+    with sf.SoundFile(str(flac)) as f:
+        sr, frames = f.samplerate, len(f)
+        a = int(from_sec * sr)
+        b = frames if to_sec is None else min(frames, int(to_sec * sr))
+        a = max(0, min(a, frames - 1))
+        b = max(a + 1, min(b, frames))
+        f.seek(a)
+        data = f.read(b - a, dtype="float32", always_2d=True)
+    bucket = max(1, data.shape[0] // n)
+    m = (data.shape[0] // bucket) * bucket
+    view = data[:m].reshape(-1, bucket, data.shape[1])
+    payload = {
+        "duration_s": row.get("duration_s") or round(frames / sr, 2),
+        "from_sec": round(a / sr, 3),
+        "to_sec": round(b / sr, 3),
+        "min": view.min(axis=(1, 2)).round(4).tolist(),
+        "max": view.max(axis=(1, 2)).round(4).tolist(),
+        "rms": np.sqrt((view.mean(axis=2) ** 2).mean(axis=1)).round(4).tolist(),
+    }
+    if full:
+        store.put_peaks(stem, n, payload)
+    return payload
+
+
+@app.post("/api/gallery/{stem}/set-main")
+def track_set_main(stem: str):
+    """Флаг «основная» версии песни (внутри группы корень + версии)."""
+    stem = _clean_stem(stem)
+    row = _need_track(stem)
+    root = _root_of(row)
+    store.set_main(root, stem)
+    return {"ok": True, "main": stem}
+
+
+# ---------- ABC готовой записи: посмотреть/править/перегенерировать ----------
+
+@app.get("/api/gallery/{stem}/abc")
+def track_abc(stem: str):
+    stem = _clean_stem(stem)
+    row = _need_track(stem)
+    text = row.get("abc_text") or row.get("score_abc")
+    if not text:
+        raise HTTPException(404, "у записи нет партитуры")
+    import abcparse
+
+    tl = abcparse.parse_abc(text)
+    return {
+        "abc": text,
+        "source": "edited" if row.get("abc_text") else "model",
+        "abc_source": row.get("abc_source"),
+        "duration_sec": tl.get("duration_sec"),
+        "audio_duration": row.get("duration_s"),
+        "tempo_bpm": tl.get("tempo_bpm"),
+    }
+
+
+class AbcRequest(BaseModel):
+    text: str = Field(..., min_length=10, max_length=400_000)
+
+
+@app.post("/api/gallery/{stem}/abc")
+def track_abc_save(stem: str, req: AbcRequest):
+    """Сохранить правленую партитуру (план модели в БД не трогается),
+    сбросить кеш таймлайна, вернуть свежий таймлайн с rms."""
+    stem = _clean_stem(stem)
+    row = _need_track(stem)
+    import abcparse
+
+    text = req.text.strip()
+    try:
+        tl = abcparse.parse_abc(text)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(422, f"ABC не разобран: {type(e).__name__}: {e}")
+    if not tl.get("bars"):
+        raise HTTPException(422, "в партитуре нет тактов — проверьте нотацию")
+    store.update_track(stem, abc_text=text, abc_source="edit")
+    store.del_score_cache(stem)
+    tl["rms_sections"] = _rms_sections(OUT / row["file"], tl["bars"])
+    store.put_score_cache(stem, _abc_hash(text), tl)
+    return tl
+
+
+@app.post("/api/gallery/{stem}/abc/reset")
+def track_abc_reset(stem: str):
+    """Вернуть план модели (правка стирается)."""
+    stem = _clean_stem(stem)
+    row = _need_track(stem)
+    if not row.get("score_abc"):
+        raise HTTPException(404, "плана модели нет — сбрасывать нечего")
+    store.update_track(stem, abc_text=None, abc_source=None)
+    store.del_score_cache(stem)
+    return track_score(stem)
+
+
+@app.get("/api/gallery/{stem}/abc/download")
+def track_abc_download(stem: str):
+    stem = _clean_stem(stem)
+    row = _need_track(stem)
+    text = row.get("abc_text") or row.get("score_abc")
+    if not text:
+        raise HTTPException(404, "у записи нет партитуры")
+    name = (slugify(row.get("title") or "") or stem)[:60] + ".abc"
+    return Response(
+        text, media_type="text/plain; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{name}"'},
+    )
+
+
+class RerenderRequest(BaseModel):
+    abc: str = Field("", max_length=400_000, description="Пусто — взять сохранённую партитуру")
+    draft: bool = Field(False, description="Черновик ~15–20 с")
+
+
+@app.post("/api/gallery/{stem}/rerender")
+def track_rerender(stem: str, req: RerenderRequest):
+    """Ре-рендер песни по (правленой) партитуре: стиль/голос/лирика/seed/cfg
+    берутся из записи, cot=melody. Результат — новая версия песни."""
+    stem = _clean_stem(stem)
+    row = _need_track(stem)
+    score = (req.abc or "").strip() or row.get("abc_text") or row.get("score_abc")
+    if not score:
+        raise HTTPException(422, "у записи нет партитуры — ре-рендер невозможен")
+    lyrics = (row.get("lyrics") or "").strip()
+    if len(lyrics) < 2:
+        raise HTTPException(422, "у записи нет лирики")
+    if ENGINE.error:
+        raise HTTPException(503, f"модель не загрузилась: {ENGINE.error}")
+    jid = uuid.uuid4().hex[:12]
+    with JOBS_LOCK:
+        JOBS[jid] = {
+            "id": jid, "status": "queued", "stage": "в очереди",
+            "style": row.get("style") or "", "style_base": row.get("style_base") or "",
+            "voice": row.get("voice") or "", "title": row.get("title") or "",
+            "lyrics": lyrics, "cot": "melody", "cfg_scale": row.get("cfg_scale"),
+            "seed": row.get("seed") if row.get("seed") is not None else -1,
+            "abc": score, "arc": "", "draft": req.draft,
+            "version_parent": stem,
+            "version_label": "рендер по ABC" + (" (черновик)" if req.draft else ""),
+            "elapsed_s": 0.0, "tokens": 0, "tok_per_s": None, "pct": None,
+            "cancel": False, "created": time.time(),
+        }
+    store.job_create(jid, {"kind": "rerender", "parent": stem,
+                           "title": row.get("title"), "draft": req.draft})
+    QUEUE.put(jid)
+    return {"id": jid, "parent": stem}
+
+
+# ---------- микшер слоёв: овердабы + импортированное аудио → версия-микс ----------
+
+@app.get("/api/gallery/{stem}/lanes")
+def track_lanes(stem: str):
+    """Дорожки-слои: овердаб-партии и импортированное аудио этой песни."""
+    stem = _clean_stem(stem)
+    _need_track(stem)
+    lanes = [{"stem": c["stem"], "title": c.get("title") or c["stem"],
+              "duration_s": c.get("duration_s"),
+              "kind": "overdub" if c.get("overdub_of") else "import",
+              "url": f"/outputs/{c['file']}"}
+             for c in store.lanes_rows(stem)]
+    return {"lanes": lanes}
+
+
+@app.post("/api/gallery/{stem}/import-lane")
+async def track_import_lane(stem: str, request: Request):
+    """Импорт своего аудио (mp3/wav/flac/…) как дорожки-слоя песни.
+    Тело — сырые байты файла; ?title= — подпись дорожки."""
+    from fastapi.concurrency import run_in_threadpool
+
+    stem = _clean_stem(stem)
+    _need_track(stem)
+    data = await request.body()
+    if not data:
+        raise HTTPException(422, "пустое тело — приложите аудиофайл")
+    if len(data) > 100 * 2**20:
+        raise HTTPException(422, "файл больше 100 МБ")
+    title = (request.query_params.get("title") or "").replace("\n", " ").strip()[:80]
+
+    def _import() -> dict:
+        import subprocess
+        import tempfile
+
+        now = datetime.now()
+        new_stem = (f"{now.strftime('%Y%m%d-%H%M%S')}-"
+                    f"{slugify(title) or 'import'}-{uuid.uuid4().hex[:6]}")
+        dst = OUT / f"{new_stem}.flac"
+        with tempfile.TemporaryDirectory(prefix="imp-") as tmp:
+            src = Path(tmp) / "in"
+            src.write_bytes(data)
+            proc = subprocess.run(
+                ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                 "-i", str(src), "-ar", "48000", "-ac", "2",
+                 "-codec:a", "flac", "-sample_fmt", "s32",
+                 "-bits_per_raw_sample", "24", str(dst)],
+                capture_output=True, timeout=300)
+        if proc.returncode != 0 or not dst.is_file():
+            err = proc.stderr.decode(errors="replace").strip().splitlines()[-1:]
+            raise HTTPException(422, "аудио не разобрано: " +
+                                (err[0] if err else f"exit {proc.returncode}"))
+        import soundfile as sf
+
+        info = sf.info(str(dst))
+        now_iso = now.isoformat(timespec="seconds")
+        store.upsert_track({
+            "stem": new_stem, "file": dst.name,
+            "title": title or "импорт",
+            "duration_s": round(info.frames / info.samplerate, 2),
+            "sample_rate": info.samplerate,
+            "ts": now_iso, "created": now_iso, "lane_of": stem,
+        })
+        return {"stem": new_stem, "title": title or "импорт",
+                "duration_s": round(info.frames / info.samplerate, 2),
+                "url": f"/outputs/{dst.name}"}
+
+    return await run_in_threadpool(_import)
+
+
+class CompPart(BaseModel):
+    stem: str
+    from_sec: float = Field(..., ge=0)
+    to_sec: float = Field(..., gt=0)
+
+
+class CompRequest(BaseModel):
+    parts: list[CompPart] = Field(..., min_length=1, max_length=16)
+    label: str = Field("", max_length=120)
+
+
+@app.post("/api/gallery/{stem}/comp")
+def track_comp(stem: str, req: CompRequest):
+    """Компинг: склейка фрагментов разных версий одной песни в новую версию.
+    Латент собирается из латентов частей, таймлайн секций — best-effort."""
+    import soundfile as sf
+
+    stem = _clean_stem(stem)
+    row = _need_track(stem)
+    root = _root_of(row)
+    d = OUT / f"{stem}.d"
+    d.mkdir(exist_ok=True)
+    tmp = d / f"comp-{uuid.uuid4().hex[:8]}.flac"
+
+    audio_parts, lat_parts, bar_parts = [], [], []
+    offset = 0.0
+    names = []
+    import abcparse
+
+    for part in req.parts:
+        pstem = _clean_stem(part.stem)
+        prow = store.get_track(pstem)
+        if prow is None or _root_of(prow) != root:
+            raise HTTPException(422, f"{part.stem} — не из этой песни")
+        pdur = prow.get("duration_s") or 0.0
+        a = max(0.0, min(part.from_sec, pdur - 0.1))
+        b = min(max(part.to_sec, a + 0.1), pdur)
+        seg, sr = sf.read(str(OUT / prow["file"]), dtype="float32",
+                          always_2d=True, start=int(a * 48000), stop=int(b * 48000))
+        audio_parts.append(seg)
+        if prow.get("latent"):
+            try:
+                z = np.load(io.BytesIO(prow["latent"]))
+                la, lb = int(a * LATENT_HZ), int(b * LATENT_HZ)
+                lat_parts.append(z[max(0, la):max(la + 1, min(lb, len(z)))])
+            except Exception:  # noqa: BLE001
+                pass
+        # таймлайн части: такты, попавшие в диапазон, со сдвигом на offset
+        pabc = prow.get("abc_text") or prow.get("score_abc")
+        if pabc:
+            try:
+                ptl = abcparse.parse_abc(pabc)
+                for bar in ptl["bars"]:
+                    if bar["end_sec"] <= a or bar["start_sec"] >= b:
+                        continue
+                    s = max(a, bar["start_sec"]) - a + offset
+                    e = min(b, bar["end_sec"]) - a + offset
+                    if e - s >= 0.05:
+                        bar_parts.append({**bar, "start_sec": round(s, 2),
+                                          "end_sec": round(e, 2)})
+            except Exception:  # noqa: BLE001
+                pass
+        names.append(("ориг" if pstem == root else
+                      f"v{prow.get('version_n') or '?'}") + f"[{a:.0f}–{b:.0f}]")
+        offset += b - a
+    if not audio_parts:
+        raise HTTPException(422, "пустой комп")
+    out = np.concatenate(audio_parts)
+    peak = float(np.abs(out).max())
+    if peak > 1.0:
+        out /= peak
+    sf.write(str(tmp), out, sr, subtype="PCM_24")
+    lat = None
+    if lat_parts:
+        lat = np.concatenate(lat_parts)
+        buf = io.BytesIO()
+        np.save(buf, np.asarray(lat, dtype=np.float16))
+        lat = buf.getvalue()
+    label = req.label.strip() or "комп: " + " + ".join(names)
+    ver = _create_version(stem, tmp, label[:120], latent_bytes=lat)
+    if bar_parts:  # свой таймлайн вместо унаследованного
+        bar_parts.sort(key=lambda x: x["start_sec"])
+        tlc = {"tempo_bpm": 0, "key": "", "meter": "4/4", "unit": 1,
+               "voices": {}, "voice_order": [], "bars": bar_parts,
+               "duration_sec": round(offset, 2),
+               "rms_sections": _rms_sections(OUT / f"{ver['stem']}.flac", bar_parts)}
+        store.put_score_cache(ver["stem"], "comp:" + _abc_hash(label), tlc)
+    return {"stem": ver["stem"], "file": ver["file"], "url": ver["audio_url"],
+            "label": ver.get("version_label"), "version_n": ver.get("version_n")}
+
+
+@app.get("/api/gallery/{stem}/export")
+def track_export(stem: str, fmt: str = "flac",
+                 from_sec: float = 0.0, to_sec: Optional[float] = None):
+    """Экспорт диапазона в файл (по умолчанию вся песня), без создания версии."""
+    import subprocess
+
+    if fmt not in ("flac", "mp3"):
+        raise HTTPException(422, "fmt: flac или mp3")
+    stem = _clean_stem(stem)
+    row = _need_track(stem)
+    dur = row.get("duration_s") or 0.0
+    a = max(0.0, min(from_sec, dur - 0.5))
+    b = min(dur if to_sec is None else max(a + 0.5, min(to_sec, dur)), dur)
+    d = OUT / f"{stem}.d"
+    d.mkdir(exist_ok=True)
+    name = f"export-{a:.0f}-{b:.1f}.{fmt}"
+    out = d / name
+    if not out.is_file():
+        cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+               "-ss", f"{a:.2f}", "-t", f"{b - a:.2f}", "-i", str(OUT / row["file"])]
+        if fmt == "mp3":
+            cmd += ["-codec:a", "libmp3lame", "-b:a", "320k"]
+        cmd.append(str(out))
+        proc = subprocess.run(cmd, capture_output=True)
+        if proc.returncode != 0:
+            raise HTTPException(500, "ffmpeg: экспорт не удался")
+    base = slugify(row.get("title") or "") or stem
+    fname = f"{base} [{a:.0f}-{b:.0f}c].{fmt}"
+    return FileResponse(out, filename=fname,
+                        media_type="audio/flac" if fmt == "flac" else "audio/mpeg")
+
+
+@app.get("/api/gallery/{stem}/export-multitrack")
+def track_export_multitrack(stem: str):
+    """Мультитрек-экспорт: zip с основным треком и всеми слоями (flac)."""
+    import zipfile
+
+    stem = _clean_stem(stem)
+    row = _need_track(stem)
+    lanes = store.lanes_rows(stem)
+    files = [(row.get("title") or "main", OUT / row["file"])]
+    for l in lanes:
+        f = OUT / l["file"]
+        if f.is_file():
+            files.append((l.get("title") or l["stem"], f))
+    d = OUT / f"{stem}.d"
+    d.mkdir(exist_ok=True)
+    zpath = d / "multitrack.zip"
+    with zipfile.ZipFile(zpath, "w", zipfile.ZIP_STORED) as z:
+        used = set()
+        for name, f in files:
+            arc = (slugify(name) or "track") + ".flac"
+            k = 2
+            while arc in used:
+                arc = f"{slugify(name)}-{k}.flac"
+                k += 1
+            used.add(arc)
+            z.write(f, arcname=arc)
+    base = slugify(row.get("title") or "") or stem
+    return FileResponse(zpath, filename=f"{base} (multitrack).zip",
+                        media_type="application/zip")
+
+
+class Lane(BaseModel):
+    stem: str
+    gain: float = Field(1.0, ge=0.0, le=2.0)
+    mute: bool = False
+
+
+class MixdownRequest(BaseModel):
+    lanes: list[Lane] = Field(..., min_length=1,
+                              description="Первая дорожка — сам трек")
+    label: str = Field("", max_length=120)
+
+
+@app.post("/api/gallery/{stem}/mixdown")
+def track_mixdown(stem: str, req: MixdownRequest):
+    """Собрать микс из слоёв (трек + овердабы с гейнами) → новая версия.
+    Обобщение _mix_overdub: микс до самой длинной дорожки, фейд 50 мс
+    в конце, пик-нормализация."""
+    stem = _clean_stem(stem)
+    main = _need_track(stem)
+    if req.lanes[0].stem != stem:
+        raise HTTPException(422, "первая дорожка микса — сам трек")
+    import soundfile as sf
+
+    parts: list[tuple[Lane, Path, str]] = []   # (lane, flac, подпись)
+    for lane in req.lanes:
+        if lane.stem == stem:
+            parts.append((lane, OUT / main["file"], main.get("title") or stem))
+            continue
+        child = store.get_track(lane.stem)
+        if child is None or (child.get("overdub_of") != stem and
+                             child.get("lane_of") != stem):
+            raise HTTPException(422, f"{lane.stem} — не слой этого трека")
+        f = OUT / child["file"]
+        if not f.is_file():
+            raise HTTPException(404, f"аудио {lane.stem} не найдено")
+        parts.append((lane, f, child.get("title") or lane.stem))
+    loaded = []
+    sr = None
+    for lane, f, _t in parts:
+        if lane.mute:
+            continue
+        a, asr = sf.read(str(f), dtype="float32", always_2d=True)
+        if sr is None:
+            sr = asr
+        elif asr != sr:
+            raise HTTPException(422, "частоты дорожек не совпали")
+        loaded.append((a, lane.gain))
+    if not loaded:
+        raise HTTPException(422, "все дорожки выключены — миксовать нечего")
+    n = max(len(a) for a, _ in loaded)
+    mix = np.zeros((n, loaded[0][0].shape[1]), dtype=np.float32)
+    for a, g in loaded:
+        mix[:len(a)] += a * g
+    fade = min(int(0.05 * sr), n)
+    if fade:
+        mix[-fade:] *= np.linspace(1, 0, fade)[:, None]
+    peak = float(np.abs(mix).max())
+    if peak > 1.0:
+        mix /= peak
+    d = OUT / f"{stem}.d"
+    d.mkdir(exist_ok=True)
+    tmp = d / f"mix-{uuid.uuid4().hex[:8]}.flac"
+    sf.write(str(tmp), mix, sr, subtype="PCM_24")
+    names = " + ".join(t for lane, _f, t in parts if not lane.mute and lane.stem != stem)
+    label = req.label.strip() or ("микс: " + names if names else "микс (соло)")
+    ver = _create_version(stem, tmp, label[:120])
+    return {"stem": ver["stem"], "file": ver["file"], "url": ver["audio_url"],
+            "label": ver.get("version_label"), "version_n": ver.get("version_n")}
 
 
 # ---------- овердаб: дочерняя генерация по партитуре родителя ----------
@@ -920,6 +1862,7 @@ def _mix_overdub(parent_flac: Path, child_flac: Path, gain: float, parent_stem: 
 class OverdubRequest(BaseModel):
     style: str = Field(..., min_length=3, description="Стиль дублирующей партии")
     lyrics: str = Field("", description="Пусто — берётся лирика родителя")
+    instrumental: bool = Field(False, description="Без вокала: лирика заменяется [Instrumental]-секциями по партитуре")
     gain: float = Field(0.5, ge=0.05, le=1.0)
     seed: int = Field(-1, ge=-1)
     title: str = Field("")
@@ -927,31 +1870,41 @@ class OverdubRequest(BaseModel):
 
 @app.post("/api/gallery/{stem}/overdub")
 def track_overdub(stem: str, req: OverdubRequest):
-    """Овердаб: джоба-потомок по score.abc родителя (или .abc кавера);
-    после рендера автоматически смешивается с родителем (gain)."""
+    """Овердаб: джоба-потомок по партитуре записи (из БД); после рендера
+    автоматически смешивается с родителем (gain)."""
     stem = _clean_stem(stem)
-    abc_path = OUT / f"{stem}.score.abc"
-    if not abc_path.is_file():
-        abc_path = OUT / f"{stem}.abc"
-    if not abc_path.is_file():
+    row = _need_track(stem)
+    abc_text = row.get("abc_text") or row.get("score_abc")
+    if not abc_text:
         raise HTTPException(404, "у записи нет партитуры — овердаб невозможен")
     if ENGINE.error:
         raise HTTPException(503, f"модель не загрузилась: {ENGINE.error}")
-    lyrics = req.lyrics.strip()
-    if not lyrics:
-        meta_path = OUT / f"{stem}.json"
-        if meta_path.is_file():
-            try:
-                lyrics = (json.loads(meta_path.read_text(encoding="utf-8"))
-                          .get("lyrics") or "").strip()
-            except ValueError:
-                pass
-    if len(lyrics) < 2:
-        raise HTTPException(422, "нет лирики ни в запросе, ни у родителя")
-    abc_text = abc_path.read_text(encoding="utf-8").strip()
+    if req.instrumental:
+        # инструментал: теги [Instrumental] по числу секций партитуры —
+        # партия без вокала, идущая по той же структуре, что и трек
+        import abcparse
+
+        try:
+            tl = abcparse.parse_abc(abc_text)
+            seen, n = set(), 0
+            for b in tl["bars"]:
+                if b["section"] not in seen:
+                    seen.add(b["section"])
+                    n += 1
+            n = n or 4
+        except Exception:  # noqa: BLE001 — партитура не разобралась, возьмём 4
+            n = 4
+        lyrics = "\n".join(["[Instrumental]"] * max(1, min(16, n)))
+    else:
+        lyrics = req.lyrics.strip()
+        if not lyrics:
+            lyrics = (row.get("lyrics") or "").strip()
+        if len(lyrics) < 2:
+            raise HTTPException(422, "нет лирики ни в запросе, ни у родителя")
     jid = uuid.uuid4().hex[:12]
     style_base = req.style.strip()
-    title = (req.title.strip() or f"овердаб · {stem}")[:80]
+    title = (req.title.strip() or
+             f"овердаб{' (инструментал)' if req.instrumental else ''} · {stem}")[:80]
     with JOBS_LOCK:
         JOBS[jid] = {
             "id": jid, "status": "queued", "stage": "в очереди",
@@ -963,11 +1916,13 @@ def track_overdub(stem: str, req: OverdubRequest):
             "elapsed_s": 0.0, "tokens": 0, "tok_per_s": None, "pct": None,
             "cancel": False, "created": time.time(),
         }
+    store.job_create(jid, {"kind": "overdub", "parent": stem, "title": title,
+                           "gain": req.gain, "seed": req.seed})
     QUEUE.put(jid)
     return {"id": jid, "parent": stem}
 
 
-# ---------- переименование (только мета, файлы не трогаем) ----------
+# ---------- переименование (только мета в БД) ----------
 
 class RenameRequest(BaseModel):
     title: str = Field(..., min_length=1)
@@ -976,13 +1931,11 @@ class RenameRequest(BaseModel):
 @app.post("/api/gallery/{stem}/rename")
 def rename_track(stem: str, req: RenameRequest):
     stem = _clean_stem(stem)
-    meta_path = OUT / f"{stem}.json"
-    if not meta_path.is_file():
+    if store.get_track(stem) is None:
         raise HTTPException(404, "запись не найдена")
-    meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    meta["title"] = req.title.strip()[:80]
-    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8")
-    return {"title": meta["title"]}
+    title = req.title.strip()[:80]
+    store.update_track(stem, title=title)
+    return {"title": title}
 
 
 @app.get("/api/outputs/{name}/wav")
@@ -1031,45 +1984,50 @@ def to_mp3(name: str, q: int = 320):
 
 @app.delete("/api/gallery/{stem}")
 def delete_track(stem: str):
-    """Удаление записи: flac + json + кеш mp3 + партитура + латенты + производные
-    (outputs/<stem>.d/ — превью, DSP-варианты, овердабы, кеши метрик)."""
+    """Удаление: аудиофайлы (flac + кеши конверсий + производное аудио в
+    <stem>.d/) и строки БД. Удаление корня каскадно удаляет все версии песни."""
     import re
 
     if not re.fullmatch(r"[\w.-]+", stem):
         raise HTTPException(422, "недопустимое имя")
     stem = stem[:-5] if stem.endswith(".flac") else stem
-    removed = []
-    for suf in (".flac", ".json", ".mp3", ".48k.mp3", ".abc", ".score.abc", ".latent.npy", ".wav"):
-        p = OUT / f"{stem}{suf}"
-        if p.is_file():
-            p.unlink()
-            removed.append(p.name)
-    d = OUT / f"{stem}.d"
-    if d.is_dir():
-        shutil.rmtree(d)
-        removed.append(f"{d.name}/")
-    if not removed:
+    row = store.get_track(stem)
+    if row is None:
         raise HTTPException(404, "запись не найдена")
-    return {"ok": True, "removed": removed}
+    root = _root_of(row)
+    if stem == root:
+        stems = [r["stem"] for r in store.group_rows(root)]
+    else:
+        stems = [stem]
+    removed = []
+    for s in stems:
+        for suf in (".flac", ".wav", ".mp3", ".48k.mp3"):
+            p = OUT / f"{s}{suf}"
+            if p.is_file():
+                p.unlink()
+                removed.append(p.name)
+        d = OUT / f"{s}.d"
+        if d.is_dir():
+            shutil.rmtree(d)
+            removed.append(f"{d.name}/")
+    store.delete_tracks(stems)
+    return {"ok": True, "removed": removed, "stems": stems}
 
 
 @app.post("/api/gallery/{stem}/like")
 def like_track(stem: str):
-    """Отметка «понравилось»: liked в мете json (галерея его уже отдаёт)."""
+    """Отметка «понравилось»: liked в БД (галерея его уже отдаёт)."""
     import re
 
     if not re.fullmatch(r"[\w.-]+", stem):
         raise HTTPException(422, "недопустимое имя")
     stem = stem[:-5] if stem.endswith(".flac") else stem
-    meta_path = OUT / f"{stem}.json"
-    if not meta_path.is_file():
+    row = store.get_track(stem)
+    if row is None:
         raise HTTPException(404, "запись не найдена")
-    meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    meta["liked"] = not meta.get("liked", False)
-    meta_path.write_text(
-        json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8"
-    )
-    return {"liked": meta["liked"]}
+    liked = not bool(row.get("liked"))
+    store.update_track(stem, liked=1 if liked else 0)
+    return {"liked": liked}
 
 
 @app.get("/api/jobs/{jid}")
@@ -1083,20 +2041,18 @@ def job_status(jid: str):
 
 @app.get("/api/gallery")
 def gallery():
-    items = []
-    for meta_path in sorted(OUT.glob("*.json"), reverse=True)[:100]:
-        try:
-            meta = json.loads(meta_path.read_text(encoding="utf-8"))
-            meta["audio_url"] = f"/outputs/{meta['file']}"
-            items.append(meta)
-        except Exception:  # noqa: BLE001 — битые меты не ломают галерею
-            continue
-    return items
+    return store.list_tracks()
 
 
 @app.get("/")
 def index():
     return FileResponse(BASE / "static" / "index.html")
+
+
+@app.get("/studio")
+def studio():
+    """Студия-редактор: волна, правки звука, ABC, версии песни."""
+    return FileResponse(BASE / "static" / "studio.html")
 
 
 app.mount("/outputs", StaticFiles(directory=OUT), name="outputs")

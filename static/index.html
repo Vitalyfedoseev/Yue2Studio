@@ -161,26 +161,6 @@
   .modal h3 { margin: 0 0 8px; font-size: 16px; }
   .modal .btn { margin-top: 12px; }
 
-  /* лента секций трека */
-  .secstrip { display: flex; flex-wrap: wrap; gap: 6px; }
-  .secchip { font-size: 11px; padding: 3px 8px; border-radius: 6px; cursor: pointer;
-    background: var(--panel2); border: 1px solid var(--border); color: var(--muted); }
-  .secchip:hover { color: var(--text); border-color: var(--accent); }
-  .secchip b { color: var(--text); font-weight: 600; }
-  .secchip.off { opacity: .55; }
-
-  /* пары ключ-значение (метрики) и дельты */
-  .kv { display: grid; grid-template-columns: 1fr 1fr; gap: 3px 16px; font-size: 12px; }
-  .kv > div { display: flex; justify-content: space-between; gap: 8px;
-    border-bottom: 1px dashed color-mix(in srgb, var(--border) 55%, transparent); padding: 2px 0; }
-  .d-up { color: var(--ok); } .d-down { color: var(--err); } .d-zero { color: var(--muted); }
-
-  /* крутилки параметров DSP */
-  .param { margin: 7px 0; max-width: 100%; }
-  .param label { margin: 0 0 2px; display: flex; justify-content: space-between; min-width: 0; }
-  .param input[type=range] { display: block; width: 100%; max-width: 100%;
-    padding: 0; accent-color: var(--accent); }
-
   .iconbtn { flex: none; cursor: pointer; color: var(--muted); padding: 5px 10px;
     border-radius: 8px; border: 1px solid var(--border); background: var(--panel2);
     font-size: 13px; user-select: none; }
@@ -298,6 +278,7 @@
       <div id="trackInfo" hidden>
         <div style="display:flex; align-items:center; gap:8px">
           <div class="ttitle" id="tTitle" style="flex:1; min-width:0"></div>
+          <span class="iconbtn" id="tStudio" title="Открыть в студии: волна, правки звука, ABC, версии">студия →</span>
           <span class="iconbtn" id="tRepeat" title="Вернуть параметры этой записи в форму">↺ повторить</span>
           <span class="iconbtn" id="tRename" title="Переименовать (только метка, файлы не трогаем)">✎ имя</span>
         </div>
@@ -311,45 +292,6 @@
           <div class="tblock"><div class="tlabel">Стиль</div><div class="ttext" id="tStyle"></div></div>
           <div class="tblock" id="tVoiceBlock" hidden><div class="tlabel">Голос</div><div class="ttext" id="tVoice"></div></div>
           <div class="tblock"><div class="tlabel">Текст</div><div class="ttext lyrico" id="tLyrics"></div></div>
-          <details class="tblock" id="sectionsBlock" hidden>
-            <summary class="tlabel" style="cursor:pointer">Секции трека — клик по секции = превью фрагмента (декод латентов)</summary>
-            <div class="secstrip" id="secStrip"></div>
-            <audio id="previewAudio" controls style="margin-top:8px" hidden></audio>
-          </details>
-          <details class="tblock" id="metricsBlock" hidden>
-            <summary class="tlabel" style="cursor:pointer">Метрики (темп, тональность, динамика, полосы)</summary>
-            <div style="display:flex; gap:8px; align-items:center; margin:6px 0">
-              <select id="cmpSel" style="width:auto; flex:none"><option value="">сравнить с…</option></select>
-              <span class="hint" id="metricsHint"></span>
-            </div>
-            <div class="kv" id="metricsKv"></div>
-          </details>
-          <details class="tblock" id="dspBlock" hidden>
-            <summary class="tlabel" style="cursor:pointer">DSP — «стена» / «кассета» (ffmpeg)</summary>
-            <div style="display:flex; gap:8px; margin:6px 0">
-              <select id="dspChain" style="width:auto; flex:none"></select>
-              <span class="hint" id="dspNote" style="align-self:center"></span>
-            </div>
-            <div id="dspParams"></div>
-            <div class="row" style="margin-top:8px">
-              <span class="iconbtn" id="dspApply" style="text-align:center">Применить к треку</span>
-              <span class="iconbtn" id="dspPreview" style="text-align:center">Превью 15 с</span>
-            </div>
-            <div id="dspVariants" style="margin-top:8px"></div>
-          </details>
-          <details class="tblock" id="odBlock" hidden>
-            <summary class="tlabel" style="cursor:pointer">Овердаб — сыграть ещё партию поверх этого трека</summary>
-            <div class="hint" style="margin:6px 0 0">Дочерняя генерация по партитуре записи; после рендера автоматически смешивается с родителем (гейн ниже).</div>
-            <div class="tags" id="odChips" style="margin-top:6px"></div>
-            <textarea id="odStyle" rows="2" style="margin-top:6px" placeholder="Стиль партии: акустическая гитара, слайд…"></textarea>
-            <textarea id="odLyrics" rows="2" style="margin-top:6px" placeholder="Текст дублирующего вокала (пусто — как у родителя)"></textarea>
-            <div style="display:flex; gap:8px; align-items:center; margin-top:6px">
-              <span class="iconbtn" id="odLyricsFill">♪ текст этого трека</span>
-              <label style="margin:0; white-space:nowrap">гейн <b id="odGainVal">0.5</b></label>
-              <input type="range" id="odGain" min="0.1" max="1" step="0.05" value="0.5" style="flex:1">
-            </div>
-            <button class="btn ghost" id="odGo" style="width:100%">Сгенерировать овердаб</button>
-          </details>
           <div class="tblock"><div class="tlabel">Тех. информация</div><div class="ttext mono" id="tTech"></div></div>
         </div>
         <div class="row" style="margin-top:12px; flex-wrap:wrap">
@@ -391,7 +333,7 @@
   </div>
 </div>
 
-<script src="/static/stylelib.js"></script>
-<script src="/static/app.js"></script>
+<script src="/static/stylelib.js?v=2"></script>
+<script src="/static/app.js?v=2"></script>
 </body>
 </html>

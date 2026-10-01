@@ -486,6 +486,8 @@ let onlyLiked = false;    // фильтр истории: только ★
 function fmtChips(m) {
   const c = [fmtDur(m.duration_s), m.sample_rate + ' Гц'];
   if (m.liked) c.push('★ нравится');
+  if (m.version_of) c.push('вариант-трек');
+  if (m.group_main) c.push('основная');
   if (m.abc_file) c.push('кавер по MIDI');
   if (m.draft) c.push('черновик');
   if (m.arc) c.push('дуга: ' + m.arc);
@@ -525,7 +527,7 @@ function play(url, meta, autoplay) {
   $('dlWav').setAttribute('download', dlBase + '.wav');
   if (meta.abc_file) {
     $('dlAbc').hidden = false;
-    $('dlAbc').href = `/outputs/${encodeURIComponent(meta.abc_file)}`;
+    $('dlAbc').href = `/api/gallery/${encodeURIComponent(stem)}/abc/download`;
     $('dlAbc').setAttribute('download', dlBase + '.abc');
   } else $('dlAbc').hidden = true;
   if (meta.overdub_file) {
@@ -546,9 +548,11 @@ function play(url, meta, autoplay) {
   t.push(`длительность: ${meta.duration_s} c · ${meta.sample_rate} Гц FLAC`);
   $('tTech').textContent = t.join('\n');
 
-  $('player').src = url;
+  // мгновенный старт: плеер играет MP3-версию (10 МБ вместо 55 МБ FLAC —
+  // начинает звучать сразу даже по Wi-Fi); FLAC остаётся в скачиваниях
+  $('player').src = (meta && meta.file)
+    ? `/api/outputs/${encodeURIComponent(meta.file)}/mp3` : url;
   if (autoplay) $('player').play().catch(()=>{});
-  loadCardExtras(meta);
   markGalleryItem();
 }
 
@@ -716,263 +720,6 @@ $('planRender').onclick = () => {
   submit(false, 1);
 };
 
-// ==================== карточка: секции, метрики, DSP, овердаб ====================
-let cardStem = null, cardMetrics = null;
-
-async function loadCardExtras(meta) {
-  cardStem = meta.file.replace(/\.flac$/, '');
-  cardMetrics = null;
-  $('previewAudio').hidden = true;
-
-  // лента секций (по партитуре; клик = превью декодом латентов)
-  $('sectionsBlock').hidden = true;
-  $('secStrip').innerHTML = '';
-  try {
-    const r = await fetch(`/api/gallery/${encodeURIComponent(cardStem)}/score`);
-    if (r.ok) renderSections(await r.json(), meta);
-  } catch {}
-
-  // метрики
-  $('metricsBlock').hidden = false;
-  $('metricsKv').innerHTML = '';
-  $('metricsHint').textContent = '';
-  $('cmpSel').value = '';
-  fillCmpSelect(meta);
-  loadMetrics();
-
-  // dsp
-  $('dspBlock').hidden = false;
-  initDsp();
-
-  // овердаб
-  $('odBlock').hidden = false;
-}
-
-function renderSections(s, meta) {
-  if (!s.bars || !s.bars.length) return;
-  $('sectionsBlock').hidden = false;
-  const strip = $('secStrip'); strip.innerHTML = '';
-  const audioDur = meta.duration_s || s.duration_sec;
-  for (const sec of (s.rms_sections || [])) {
-    const chip = document.createElement('span');
-    chip.className = 'secchip' + (sec.start_sec >= audioDur ? ' off' : '');
-    chip.innerHTML = `<b>${sec.section}</b> ${Math.round(sec.start_sec)}–${Math.round(sec.end_sec)}с`;
-    if (sec.rms_db != null) chip.title = `громкость секции ≈ ${sec.rms_db} дБ RMS`;
-    chip.onclick = () => previewRange(Math.max(0, sec.start_sec), Math.min(sec.end_sec, audioDur));
-    strip.appendChild(chip);
-  }
-}
-
-async function previewRange(from, to) {
-  if (!cardStem) return;
-  if (to - from < 1) to = from + 1;
-  try {
-    const r = await fetch(`/api/gallery/${encodeURIComponent(cardStem)}/preview`, {
-      method: 'POST', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ from_sec: from, to_sec: to }) });
-    const j = await r.json().catch(() => ({}));
-    if (!r.ok) { alert(j.detail || r.status); return; }
-    const a = $('previewAudio');
-    a.hidden = false; a.src = j.url; a.play().catch(()=>{});
-  } catch (e) { alert('Сервер недоступен: ' + e); }
-}
-
-// ---------- метрики ----------
-const METRIC_ROWS = [
-  ['tempo_bpm', 'темп, BPM', 1], ['key', 'тональность', null],
-  ['rms_p95_db', 'RMS p95, дБ', 1], ['rms_median_db', 'RMS медиана, дБ', 1],
-  ['dyn_range_db', 'динамика, дБ', 1], ['crest_db', 'крест-фактор, дБ', 1],
-  ['peak', 'пик', 3], ['clip_pct', 'клиппинг, %', 3],
-  ['noise_floor_db', 'пол шума, дБ', 1], ['signal_noise_db', 'SNR, дБ', 1],
-  ['bands.bass', 'бас, %', 1], ['bands.low_mid', 'низк. середина, %', 1],
-  ['bands.mid', 'середина, %', 1], ['bands.high', 'верх, %', 1], ['bands.air', 'воздух, %', 1],
-  ['centroid_hz', 'центроид, Гц', 0], ['f95_hz', 'f95, Гц', 0], ['f99_hz', 'f99, Гц', 0],
-  ['flatness_median', 'плоскость', 3], ['flatness_loud', 'плоскость (громк.)', 3],
-  ['stereo_corr', 'стерео-корр.', 2], ['mid_db', 'mid, дБ', 1], ['side_db', 'side, дБ', 1],
-];
-function mget(m, key) {
-  return key.startsWith('bands.') ? (m.bands || {})[key.slice(6)] : m[key];
-}
-function renderMetrics(m, ref) {
-  const kv = $('metricsKv'); kv.innerHTML = '';
-  for (const [key, label, dec] of METRIC_ROWS) {
-    const v = mget(m, key);
-    if (v === null || v === undefined) continue;
-    let right = `<span>${v}</span>`;
-    if (ref) {
-      const rv = mget(ref, key);
-      if (typeof v === 'number' && typeof rv === 'number') {
-        const d = v - rv;
-        const cls = Math.abs(d) < 0.05 ? 'd-zero' : (d > 0 ? 'd-up' : 'd-down');
-        right += `<span class="${cls}" title="Δ к выбранной записи">${d > 0 ? '+' : ''}${d.toFixed(dec)}</span>`;
-      }
-    }
-    const d = document.createElement('div');
-    d.innerHTML = `<span>${label}</span>${right}`;
-    kv.appendChild(d);
-  }
-}
-async function fetchMetrics(stem) {
-  const r = await fetch(`/api/gallery/${encodeURIComponent(stem)}/analyze`);
-  if (!r.ok) throw new Error(r.status);
-  return await r.json();
-}
-async function loadMetrics() {
-  if (!cardStem) return;
-  $('metricsHint').textContent = 'считаю…';
-  try {
-    cardMetrics = await fetchMetrics(cardStem);
-    $('metricsHint').textContent = '';
-    renderMetrics(cardMetrics, null);
-  } catch (e) {
-    $('metricsHint').textContent = e.message === '503' ? 'librosa недоступна на сервере' : 'нет данных';
-  }
-}
-function fillCmpSelect(meta) {
-  const sel = $('cmpSel');
-  sel.innerHTML = '<option value="">сравнить с…</option>';
-  for (const it of galleryItemsCache) {
-    if (it.file === meta.file) continue;
-    const o = document.createElement('option');
-    o.value = it.file.replace(/\.flac$/, '');
-    o.textContent = (it.title || it.file).slice(0, 40);
-    sel.appendChild(o);
-  }
-}
-$('cmpSel').onchange = async () => {
-  if (!cardMetrics) return;
-  const stem = $('cmpSel').value;
-  if (!stem) { renderMetrics(cardMetrics, null); return; }
-  try { renderMetrics(cardMetrics, await fetchMetrics(stem)); $('metricsHint').textContent = ''; }
-  catch { $('metricsHint').textContent = 'метрики сравнения недоступны'; }
-};
-
-// ---------- DSP ----------
-let dspChains = null;
-async function initDsp() {
-  if (!dspChains) {
-    try { dspChains = await (await fetch('/api/dsp/chains')).json(); } catch { dspChains = []; }
-    const sel = $('dspChain'); sel.innerHTML = '';
-    for (const c of dspChains) {
-      const o = document.createElement('option');
-      o.value = c.id; o.textContent = `${c.name} — ${c.note}`;
-      sel.appendChild(o);
-    }
-    sel.onchange = renderDspParams;
-  }
-  renderDspParams();
-  loadDspVariants();
-}
-function renderDspParams() {
-  const c = (dspChains || []).find(x => x.id === $('dspChain').value);
-  const box = $('dspParams'); box.innerHTML = '';
-  if (!c) return;
-  for (const p of c.params) {
-    const d = document.createElement('div');
-    d.className = 'param'; d.dataset.pid = p.id;
-    d.innerHTML = `<label><span>${p.label}</span><b>${p.default}</b></label>
-      <input type="range" min="${p.min}" max="${p.max}" step="${p.step}" value="${p.default}">`;
-    const rng = d.querySelector('input'), val = d.querySelector('b');
-    rng.oninput = () => { val.textContent = rng.value; };
-    box.appendChild(d);
-  }
-}
-async function runDsp(preview) {
-  if (!cardStem) return;
-  const params = {};
-  for (const d of document.querySelectorAll('#dspParams .param'))
-    params[d.dataset.pid] = parseFloat(d.querySelector('input').value);
-  $('dspNote').textContent = preview ? 'считаю превью…' : 'применяю…';
-  try {
-    const r = await fetch(`/api/gallery/${encodeURIComponent(cardStem)}/dsp`, {
-      method: 'POST', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ chain: $('dspChain').value, params, preview }) });
-    const j = await r.json().catch(() => ({}));
-    if (!r.ok) { $('dspNote').innerHTML = `<span class="err">${j.detail || r.status}</span>`; return; }
-    $('dspNote').textContent = preview ? 'превью готово (с 20-й секунды)' : 'вариант готов';
-    const a = $('previewAudio');
-    a.hidden = false; a.src = j.url + '?t=' + Date.now();
-    if (preview) a.play().catch(()=>{});
-    loadDspVariants();
-  } catch (e) { $('dspNote').innerHTML = `<span class="err">сервер: ${e}</span>`; }
-}
-$('dspApply').onclick = () => runDsp(false);
-$('dspPreview').onclick = () => runDsp(true);
-async function loadDspVariants() {
-  if (!cardStem) return;
-  let variants = [];
-  try {
-    variants = (await (await fetch(`/api/gallery/${encodeURIComponent(cardStem)}/dsp`)).json()).variants || [];
-  } catch {}
-  const box = $('dspVariants'); box.innerHTML = '';
-  if (!variants.length) { box.innerHTML = '<div class="hint">Вариантов пока нет</div>'; return; }
-  for (const v of variants) {
-    const name = v.file.split('/').pop();
-    let deltas = '';
-    if (v.metrics && cardMetrics) {
-      deltas = ['crest_db', 'dyn_range_db', 'bands.high', 'flatness_median'].map(k => {
-        const a = mget(cardMetrics, k), b = mget(v.metrics, k);
-        if (typeof a !== 'number' || typeof b !== 'number') return '';
-        const d = b - a;
-        const cls = Math.abs(d) < 0.05 ? 'd-zero' : (d > 0 ? 'd-up' : 'd-down');
-        return `<span class="${cls}" title="Δ ${k}">${d > 0 ? '+' : ''}${d.toFixed(1)}</span>`;
-      }).filter(Boolean).join(' ');
-    }
-    const d = document.createElement('div');
-    d.style.cssText = 'display:flex; gap:8px; align-items:center; padding:4px 0; font-size:12px';
-    d.innerHTML = `<span class="iconbtn" title="послушать">▶</span>` +
-      `<a class="dl" href="${v.url}" download>⤓ ${name}</a>` +
-      `<span class="hint">Δ (крест/дин/верх/плоск): ${deltas || '—'}</span>`;
-    d.querySelector('.iconbtn').onclick = () => {
-      const a = $('previewAudio');
-      a.hidden = false; a.src = v.url + '?t=' + Date.now(); a.play().catch(()=>{});
-    };
-    box.appendChild(d);
-  }
-}
-
-// ---------- овердаб ----------
-const OD_CHIPS = [
-  ['акуст. гитара', 'acoustic guitar'], ['эл. гитара', 'clean electric guitar'],
-  ['фузз', 'fuzz guitar'], ['пиано', 'grand piano'], ['орган', 'hammond organ'],
-  ['синт', 'analog synthesizer'], ['струнные', 'string section'], ['флейта', 'flute'],
-  ['сакс', 'saxophone'], ['труба', 'trumpet'], ['колокольчики', 'glockenspiel'],
-  ['перкуссия', 'hand percussion'], ['хор', 'choir'], ['скрипка', 'violin'],
-];
-(function () {
-  const box = $('odChips');
-  for (const [ru, en] of OD_CHIPS) {
-    const t = document.createElement('span');
-    t.className = 'tag'; t.textContent = ru;
-    t.onclick = () => {
-      const v = $('odStyle').value.trim();
-      $('odStyle').value = v ? v + ', ' + en : en;
-    };
-    box.appendChild(t);
-  }
-})();
-$('odGain').oninput = () => { $('odGainVal').textContent = $('odGain').value; };
-$('odLyricsFill').onclick = () => { if (currentMeta) $('odLyrics').value = currentMeta.lyrics || ''; };
-$('odGo').onclick = async () => {
-  const style = $('odStyle').value.trim();
-  if (style.length < 3) { alert('Опишите стиль партии (минимум 3 символа)'); return; }
-  if (!cardStem) return;
-  try {
-    const r = await fetch(`/api/gallery/${encodeURIComponent(cardStem)}/overdub`, {
-      method: 'POST', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ style, lyrics: $('odLyrics').value,
-                             gain: parseFloat($('odGain').value) }) });
-    const j = await r.json().catch(() => ({}));
-    if (!r.ok) { alert(j.detail || r.status); return; }
-    activeJobs.push(j.id);
-    jobStates[j.id] = { id: j.id, status: 'queued', stage: 'в очереди', tokens: 0, elapsed_s: 0 };
-    finalMsg = null; lastQueueError = null;
-    if (!pollTimer) pollTimer = setInterval(pollAll, 2000);
-    renderJobs();
-    alert('Овердаб в очереди — после рендера придёт отдельной записью, микс с родителем будет у неё в скачиваниях');
-  } catch (e) { alert('Сервер недоступен: ' + e); }
-};
-
 // ==================== повтор параметров, переименование ====================
 $('tRepeat').onclick = () => {
   if (!currentMeta) return;
@@ -985,18 +732,23 @@ $('tRepeat').onclick = () => {
   $('cfg').value = (m.cfg_scale != null && m.cfg_scale !== '') ? m.cfg_scale : '';
   $('seed').value = (m.seed != null) ? m.seed : -1;
   resetMidi();
-  if (m.abc_file) {  // был кавер — вернуть партитуру в поле ABC
-    fetch(`/outputs/${encodeURIComponent(m.abc_file)}`)
-      .then(r => r.ok ? r.text() : null)
-      .then(t => {
-        if (!t) return;
+  if (m.abc_file) {  // был кавер/правка — вернуть партитуру в поле ABC
+    fetch(`/api/gallery/${encodeURIComponent(stem)}/abc`)
+      .then(r => r.ok ? r.json() : null)
+      .then(j => {
+        if (!j || !j.abc) return;
         midiLoaded = true;
-        $('abc').value = t;
+        $('abc').value = j.abc;
         $('midiResult').hidden = false;
-        $('abcStat').textContent = `повтор кавера: ${m.abc_chars || t.length} симв. ABC`;
+        $('abcStat').textContent = `повтор кавера: ${m.abc_chars || j.abc.length} симв. ABC`;
       }).catch(() => {});
   }
   window.scrollTo({ top: 0, behavior: 'smooth' });
+};
+$('tStudio').onclick = () => {
+  if (!currentMeta) return;
+  const stem = currentMeta.file.replace(/\.flac$/, '');
+  window.open('/studio?stem=' + encodeURIComponent(stem), '_blank');
 };
 $('tRename').onclick = async () => {
   if (!currentMeta) return;
